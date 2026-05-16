@@ -255,10 +255,13 @@ def get_orders_df(limit_per_account: int = 100) -> pd.DataFrame:
                     "Type": str(o.order_type).replace("OrderType.", ""),
                     "Qty": safe_float(o.qty),
                     "Filled Qty": safe_float(o.filled_qty),
+                    "Filled Avg Price": safe_float(getattr(o, "filled_avg_price", None)),
+                    "Filled At": getattr(o, "filled_at", None),
                     "Status": str(o.status).replace("OrderStatus.", ""),
                     "Limit Price": safe_float(o.limit_price) if o.limit_price else None,
                     "Stop Price": safe_float(o.stop_price) if o.stop_price else None,
-                    "Order ID": o.id,
+                    "Order ID": str(o.id),
+                    "Client Order ID": str(getattr(o, "client_order_id", "")),
                 })
         except Exception as exc:
             rows.append({
@@ -267,9 +270,153 @@ def get_orders_df(limit_per_account: int = 100) -> pd.DataFrame:
             })
 
     df = pd.DataFrame(rows)
-    if not df.empty and "Submitted" in df.columns:
-        df["Submitted"] = to_local_time(df["Submitted"])
+    if not df.empty:
+        if "Submitted" in df.columns:
+            df["Submitted"] = to_local_time(df["Submitted"])
+        if "Filled At" in df.columns:
+            df["Filled At"] = to_local_time(df["Filled At"])
     return df
+
+
+def account_to_bot(account_name: str) -> str:
+    name = str(account_name).lower()
+    if "alligator" in name:
+        return "Alligator Bot - LIVE"
+    if "tradingview" in name or "qqq" in name or "tsla" in name or "amd" in name:
+        return "TradingView Bot - QQQ TSLA AMD"
+    if "direct" in name or "scanner" in name:
+        return "Alpaca Direct Bot - Auto Scanner"
+    return str(account_name)
+
+
+def account_to_strategy(account_name: str) -> str:
+    name = str(account_name).lower()
+    if "alligator" in name:
+        return "alligator"
+    if "tradingview" in name or "qqq" in name or "tsla" in name or "amd" in name:
+        return "tradingview_strat"
+    if "direct" in name or "scanner" in name:
+        return "alpaca_direct_scanner"
+    return "unknown"
+
+
+def build_closed_trades_from_orders(orders_df: pd.DataFrame) -> pd.DataFrame:
+    if orders_df.empty or "Error" in orders_df.columns:
+        return pd.DataFrame()
+
+    required = {"Account", "Symbol", "Side", "Filled Qty", "Filled Avg Price", "Status"}
+    if not required.issubset(set(orders_df.columns)):
+        return pd.DataFrame()
+
+    filled = orders_df.copy()
+    filled = filled[filled["Status"].astype(str).str.lower() == "filled"].copy()
+    filled = filled[pd.to_numeric(filled["Filled Qty"], errors="coerce").fillna(0) > 0]
+    filled = filled[pd.to_numeric(filled["Filled Avg Price"], errors="coerce").fillna(0) > 0]
+
+    if filled.empty:
+        return pd.DataFrame()
+
+    sort_col = "Filled At" if "Filled At" in filled.columns else "Submitted"
+    filled = filled.sort_values(sort_col)
+
+    trades = []
+    for (account, symbol), group in filled.groupby(["Account", "Symbol"], dropna=False):
+        open_lots = []
+
+        for _, order in group.iterrows():
+            side = str(order["Side"]).lower()
+            qty = safe_float(order["Filled Qty"])
+            price = safe_float(order["Filled Avg Price"])
+            timestamp = order.get(sort_col)
+            order_id = order.get("Order ID", "")
+
+            if qty <= 0 or price <= 0:
+                continue
+
+            if side == "buy":
+                open_lots.append({
+                    "qty": qty,
+                    "entry_price": price,
+                    "entry_time": timestamp,
+                    "entry_order_id": order_id,
+                })
+
+            elif side == "sell":
+                remaining = qty
+                while remaining > 0 and open_lots:
+                    lot = open_lots[0]
+                    close_qty = min(remaining, lot["qty"])
+                    pnl = (price - lot["entry_price"]) * close_qty
+                    pnl_pct = ((price - lot["entry_price"]) / lot["entry_price"] * 100) if lot["entry_price"] else 0
+
+                    trades.append({
+                        "Account": account,
+                        "Bot": account_to_bot(account),
+                        "Strategy": account_to_strategy(account),
+                        "Symbol": symbol,
+                        "Qty": close_qty,
+                        "Entry Time": lot["entry_time"],
+                        "Exit Time": timestamp,
+                        "Entry Price": lot["entry_price"],
+                        "Exit Price": price,
+                        "P/L": pnl,
+                        "P/L %": pnl_pct,
+                        "Result": "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT"),
+                        "Entry Order ID": lot["entry_order_id"],
+                        "Exit Order ID": order_id,
+                    })
+
+                    lot["qty"] -= close_qty
+                    remaining -= close_qty
+                    if lot["qty"] <= 0.000001:
+                        open_lots.pop(0)
+
+    df = pd.DataFrame(trades)
+    if not df.empty:
+        df["Exit Time"] = pd.to_datetime(df["Exit Time"], errors="coerce")
+        df["Entry Time"] = pd.to_datetime(df["Entry Time"], errors="coerce")
+        df["Exit Date"] = df["Exit Time"].dt.date
+    return df
+
+
+def summarize_closed_trades(closed_df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
+    if closed_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    grouped = closed_df.groupby(group_cols, dropna=False)
+
+    for keys, group in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        trade_count = len(group)
+        wins = int((group["P/L"] > 0).sum())
+        losses = int((group["P/L"] < 0).sum())
+        flats = int((group["P/L"] == 0).sum())
+        total_pl = group["P/L"].sum()
+        avg_pl = group["P/L"].mean()
+        win_rate = (wins / trade_count * 100) if trade_count else 0
+        gross_profit = group.loc[group["P/L"] > 0, "P/L"].sum()
+        gross_loss = abs(group.loc[group["P/L"] < 0, "P/L"].sum())
+        profit_factor = (gross_profit / gross_loss) if gross_loss else None
+
+        row = {col: value for col, value in zip(group_cols, keys)}
+        row.update({
+            "Closed Trades": trade_count,
+            "Wins": wins,
+            "Losses": losses,
+            "Flat": flats,
+            "Win Rate %": win_rate,
+            "Total P/L": total_pl,
+            "Avg P/L": avg_pl,
+            "Gross Profit": gross_profit,
+            "Gross Loss": gross_loss,
+            "Profit Factor": profit_factor,
+        })
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values("Total P/L", ascending=False)
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -566,7 +713,7 @@ else:
 
 st.divider()
 
-tab_overview, tab_accounts, tab_bots, tab_events, tab_pl, tab_positions, tab_orders, tab_performance, tab_setup = st.tabs([
+tab_overview, tab_accounts, tab_bots, tab_events, tab_pl, tab_positions, tab_orders, tab_analytics, tab_performance, tab_setup = st.tabs([
     "Overview",
     "Accounts",
     "Bot Status",
@@ -574,6 +721,7 @@ tab_overview, tab_accounts, tab_bots, tab_events, tab_pl, tab_positions, tab_ord
     "Daily P/L",
     "Open Positions",
     "Recent Orders",
+    "Trade Analytics",
     "Performance",
     "Setup",
 ])
@@ -820,6 +968,128 @@ with tab_orders:
     else:
         st.dataframe(orders_df, use_container_width=True, hide_index=True)
 
+with tab_analytics:
+    st.subheader("Trade Analytics")
+
+    st.caption(
+        "Closed-trade P/L is estimated from filled Alpaca orders using FIFO matching. "
+        "Because each strategy has its own Alpaca account, bot and strategy P/L are mapped by account."
+    )
+
+    orders_for_analytics = get_orders_df(300)
+    closed_trades_df = build_closed_trades_from_orders(orders_for_analytics)
+
+    if closed_trades_df.empty:
+        st.warning("No closed trades detected yet. This will populate after buy and sell orders both fill.")
+    else:
+        a1, a2, a3, a4 = st.columns(4)
+        total_pl = closed_trades_df["P/L"].sum()
+        closed_count = len(closed_trades_df)
+        wins = int((closed_trades_df["P/L"] > 0).sum())
+        losses = int((closed_trades_df["P/L"] < 0).sum())
+        win_rate = (wins / closed_count * 100) if closed_count else 0
+
+        a1.metric("Closed Trade P/L", money(total_pl))
+        a2.metric("Closed Trades", closed_count)
+        a3.metric("Win Rate", pct(win_rate))
+        a4.metric("Wins / Losses", f"{wins} / {losses}")
+
+        st.subheader("P/L by Account")
+        by_account = summarize_closed_trades(closed_trades_df, ["Account"])
+        st.dataframe(by_account, use_container_width=True, hide_index=True)
+        fig_account = px.bar(by_account, x="Account", y="Total P/L", text="Total P/L")
+        st.plotly_chart(fig_account, use_container_width=True)
+
+        st.subheader("P/L by Bot")
+        by_bot = summarize_closed_trades(closed_trades_df, ["Bot"])
+        st.dataframe(by_bot, use_container_width=True, hide_index=True)
+        fig_bot = px.bar(by_bot, x="Bot", y="Total P/L", text="Total P/L")
+        st.plotly_chart(fig_bot, use_container_width=True)
+
+        st.subheader("P/L by Strategy")
+        by_strategy = summarize_closed_trades(closed_trades_df, ["Strategy"])
+        st.dataframe(by_strategy, use_container_width=True, hide_index=True)
+        fig_strategy = px.bar(by_strategy, x="Strategy", y="Total P/L", text="Total P/L")
+        st.plotly_chart(fig_strategy, use_container_width=True)
+
+        st.subheader("P/L by Symbol")
+        by_symbol = summarize_closed_trades(closed_trades_df, ["Symbol"])
+        st.dataframe(by_symbol, use_container_width=True, hide_index=True)
+        fig_symbol = px.bar(by_symbol, x="Symbol", y="Total P/L", color="Symbol", text="Total P/L")
+        st.plotly_chart(fig_symbol, use_container_width=True)
+
+        st.subheader("Trade Count by Day")
+        by_day = closed_trades_df.groupby(["Exit Date"]).size().reset_index(name="Closed Trades")
+        st.dataframe(by_day.sort_values("Exit Date", ascending=False), use_container_width=True, hide_index=True)
+        fig_day = px.bar(by_day, x="Exit Date", y="Closed Trades", text="Closed Trades")
+        st.plotly_chart(fig_day, use_container_width=True)
+
+        st.subheader("Win/Loss Stats by Account")
+        by_account_result = closed_trades_df.groupby(["Account", "Result"]).size().reset_index(name="Count")
+        st.dataframe(by_account_result, use_container_width=True, hide_index=True)
+        fig_result = px.bar(by_account_result, x="Account", y="Count", color="Result", barmode="group")
+        st.plotly_chart(fig_result, use_container_width=True)
+
+        st.subheader("Closed Trade Detail")
+        detail = closed_trades_df.sort_values("Exit Time", ascending=False).copy()
+        for col in ["Entry Price", "Exit Price", "P/L"]:
+            detail[col] = detail[col].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "")
+        detail["P/L %"] = detail["P/L %"].map(lambda x: f"{x:.2f}%" if pd.notna(x) else "")
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Open vs Closed Trade Results")
+
+    positions_for_analytics = get_positions_df()
+    if not positions_for_analytics.empty and "Error" not in positions_for_analytics.columns:
+        o1, o2, o3 = st.columns(3)
+        o1.metric("Open Positions", len(positions_for_analytics))
+        o2.metric("Open Unrealized P/L", money(positions_for_analytics["Unrealized P/L"].sum()))
+        o3.metric("Open Market Value", money(positions_for_analytics["Market Value"].sum()))
+        st.dataframe(positions_for_analytics, use_container_width=True, hide_index=True)
+    else:
+        st.info("No open positions detected.")
+
+    st.divider()
+    st.subheader("Rejected-Trade Analysis")
+
+    if events_view_df.empty or "event_type" not in events_view_df.columns:
+        st.warning("No bot event data available for rejection analysis.")
+    else:
+        rejected = events_view_df[events_view_df["event_type"] == "TRADE_REJECTED"].copy()
+        if rejected.empty:
+            st.success("No rejected trade events found in the loaded event window.")
+        else:
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Rejected Trades", len(rejected))
+            r2.metric("Rejected Symbols", rejected["symbol"].nunique())
+            r3.metric("Rejected Bots", rejected["bot_name"].nunique())
+
+            st.subheader("Rejections by Reason")
+            by_reason = rejected.groupby(["message"]).size().reset_index(name="Count").sort_values("Count", ascending=False)
+            st.dataframe(by_reason, use_container_width=True, hide_index=True)
+            fig_reason = px.bar(by_reason.head(15), x="Count", y="message", orientation="h")
+            st.plotly_chart(fig_reason, use_container_width=True)
+
+            st.subheader("Rejections by Bot and Symbol")
+            by_reject_symbol = rejected.groupby(["bot_name", "symbol", "message"]).size().reset_index(name="Count").sort_values("Count", ascending=False)
+            st.dataframe(by_reject_symbol, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Placed Trade Event Counts")
+
+    if events_view_df.empty or "event_type" not in events_view_df.columns:
+        st.warning("No bot event data available.")
+    else:
+        placed = events_view_df[events_view_df["event_type"] == "TRADE_PLACED"].copy()
+        if placed.empty:
+            st.info("No TRADE_PLACED events in the loaded event window.")
+        else:
+            placed["day"] = placed["created_at"].dt.date
+            placed_counts = placed.groupby(["day", "bot_name", "symbol", "strategy"]).size().reset_index(name="Placed Trades")
+            st.dataframe(placed_counts.sort_values("day", ascending=False), use_container_width=True, hide_index=True)
+
+
 with tab_performance:
     st.subheader("Bot Event Summary")
 
@@ -872,6 +1142,12 @@ ACCOUNT_3_PAPER=true
 ```
 
 The old single-account setup still works, but it will only show one Alpaca account.
+
+### Trade Analytics Notes
+- Closed-trade P/L is estimated from filled Alpaca orders using FIFO matching.
+- Bot and strategy P/L are mapped by account because each strategy has its own Alpaca account.
+- Rejected-trade analysis comes from the shared `bot_events` database.
+- For even cleaner strategy P/L later, we can add exit-order IDs and realized P/L directly into each bot's database logs.
     """)
 
     st.code("""
@@ -879,3 +1155,4 @@ cd C:\\Users\\RodgerTucker\\coach-q-trading-dashboard
 venv\\Scripts\\activate.bat
 python -m streamlit run dashboard.py
     """, language="powershell")
+
