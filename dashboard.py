@@ -749,6 +749,103 @@ def build_weekly_review(realized_df: pd.DataFrame) -> pd.DataFrame:
         ascending=False
     )
 
+def build_parameter_suggestions(realized_df: pd.DataFrame) -> pd.DataFrame:
+    suggestions = []
+
+    if realized_df.empty:
+        return pd.DataFrame()
+
+    for symbol in realized_df["symbol"].dropna().unique():
+        s = realized_df[realized_df["symbol"] == symbol]
+
+        trades = len(s)
+        pnl = s["realized_pnl"].sum()
+        win_rate = round((s["realized_pnl"] > 0).mean() * 100, 2)
+
+        if trades >= 5 and pnl < 0:
+            suggestions.append({
+                "Type": "Reduce Exposure",
+                "Target": symbol,
+                "Reason": f"${pnl:.2f} total P/L across {trades} trades.",
+                "Suggestion": "Reduce trade frequency or temporarily pause this symbol.",
+            })
+
+        if trades >= 5 and win_rate < 35:
+            suggestions.append({
+                "Type": "Poor Win Rate",
+                "Target": symbol,
+                "Reason": f"{win_rate}% win rate.",
+                "Suggestion": "Review entries and avoid weak time windows.",
+            })
+
+    return pd.DataFrame(suggestions)
+
+
+def build_do_not_trade(realized_df: pd.DataFrame) -> pd.DataFrame:
+    if realized_df.empty:
+        return pd.DataFrame()
+
+    grouped = realized_df.groupby("symbol").agg(
+        trades=("symbol", "count"),
+        total_pnl=("realized_pnl", "sum"),
+        win_rate=("realized_pnl", lambda x: round((x > 0).mean() * 100, 2)),
+    ).reset_index()
+
+    blocked = grouped[
+        (grouped["trades"] >= 5)
+        & (
+            (grouped["total_pnl"] < -50)
+            | (grouped["win_rate"] < 25)
+        )
+    ]
+
+    return blocked.sort_values("total_pnl")
+
+
+def build_confidence_score(realized_df: pd.DataFrame) -> float:
+    if realized_df.empty:
+        return 0
+
+    pnl = realized_df["realized_pnl"].sum()
+    win_rate = (realized_df["realized_pnl"] > 0).mean() * 100
+    trades = len(realized_df)
+
+    score = 50
+
+    score += min(max(pnl / 10, -20), 20)
+    score += min(max((win_rate - 50), -20), 20)
+    score += min(trades, 20)
+
+    return round(max(0, min(100, score)), 2)
+
+
+def build_tomorrow_plan(realized_df: pd.DataFrame) -> list:
+    plan = []
+
+    if realized_df.empty:
+        return ["Collect more trade data before making adjustments."]
+
+    total_pnl = realized_df["realized_pnl"].sum()
+
+    if total_pnl > 0:
+        plan.append("Keep current strategy sizing stable.")
+    else:
+        plan.append("Reduce aggression and focus on high-quality setups.")
+
+    best_symbols = (
+        realized_df.groupby("symbol")["realized_pnl"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(3)
+    )
+
+    if not best_symbols.empty:
+        plan.append(
+            f"Focus watchlist on: {', '.join(best_symbols.index.tolist())}"
+        )
+
+    return plan
+
 
 
 def run_closed_trade_sync():
@@ -829,6 +926,7 @@ tabs = st.tabs([
     "Daily AI Recap",
     "AI Recommendations",
     "Weekly Review",
+    "AI Decision Center",
     "Strategy Scoring",
     "Symbol Intelligence",
     "Time of Day",
@@ -1003,6 +1101,57 @@ with tabs[7]:
         )
 
 with tabs[8]:
+    st.header("AI Decision Center")
+
+    confidence = build_confidence_score(realized_df)
+
+    c1, c2 = st.columns(2)
+
+    c1.metric(
+        "System Confidence Score",
+        f"{confidence}/100"
+    )
+
+    if confidence >= 75:
+        c2.success("System performance currently stable.")
+    elif confidence >= 50:
+        c2.warning("Mixed results. Continue collecting data.")
+    else:
+        c2.error("Weak performance. Review strategies carefully.")
+
+    st.subheader("Parameter Suggestions")
+
+    param_df = build_parameter_suggestions(realized_df)
+
+    if param_df.empty:
+        st.success("No major parameter warnings yet.")
+    else:
+        st.dataframe(param_df, use_container_width=True)
+
+    st.subheader("Do-Not-Trade Watchlist")
+
+    blocked_df = build_do_not_trade(realized_df)
+
+    if blocked_df.empty:
+        st.success("No symbols currently flagged.")
+    else:
+        st.dataframe(blocked_df, use_container_width=True)
+
+    st.subheader("Tomorrow Game Plan")
+
+    tomorrow_plan = build_tomorrow_plan(realized_df)
+
+    for item in tomorrow_plan:
+        st.write(f"- {item}")
+
+    st.subheader("AI Strategy Coach")
+
+    st.info(
+        "Do not change strategy rules based on one day alone. "
+        "Focus on repeated weaknesses across multiple trades and time windows."
+    )
+
+with tabs[9]:
     st.header("Strategy Scoring / Grading")
     score_rows = []
     if not realized_df.empty:
@@ -1046,7 +1195,7 @@ with tabs[8]:
     st.dataframe(pd.DataFrame(score_rows).sort_values("Activity Score", ascending=False), use_container_width=True)
 
 
-with tabs[9]:
+with tabs[10]:
     st.header("Symbol Intelligence")
 
     symbol_df = build_symbol_intelligence(realized_df)
@@ -1066,7 +1215,7 @@ with tabs[9]:
         st.bar_chart(symbol_df.set_index("symbol")[["total_pnl", "avg_pnl"]])
 
 
-with tabs[10]:
+with tabs[11]:
     st.header("Time-of-Day Analysis")
 
     time_df = build_time_of_day_analysis(realized_df)
@@ -1082,7 +1231,7 @@ with tabs[10]:
         )
 
 
-with tabs[11]:
+with tabs[12]:
     st.header("Rejection Intelligence")
 
     if rejected_df.empty:
@@ -1108,7 +1257,7 @@ with tabs[11]:
             st.dataframe(rejected_df, use_container_width=True)
 
 
-with tabs[12]:
+with tabs[13]:
     st.header("Strategy Heatmap")
 
     heat = build_strategy_heatmap(realized_df)
@@ -1121,7 +1270,7 @@ with tabs[12]:
         st.line_chart(heat)
 
 
-with tabs[13]:
+with tabs[14]:
     st.header("Rejected Orders Diagnostics")
     if rejected_df.empty:
         st.success("No rejected orders found.")
@@ -1135,7 +1284,7 @@ with tabs[13]:
         st.subheader("Rejected Details")
         st.dataframe(rejected_df.tail(300), use_container_width=True)
 
-with tabs[14]:
+with tabs[15]:
     st.header("Railway-Aware Bot Health")
 
     st.info(
