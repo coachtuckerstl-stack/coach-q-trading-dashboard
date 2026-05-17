@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -715,7 +716,7 @@ with tabs[1]:
     st.header("Unified Open Positions")
     position_rows = []
     for name, info in BOTS.items():
-        positions, err = load_alpaca_positions(info["env"])
+        positions, err = load_alpaca_positions(info)
         if err:
             st.warning(f"{name}: {err}")
             continue
