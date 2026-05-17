@@ -33,6 +33,9 @@ BOTS = {
         "strategy": "breakout_momentum_v1",
         "model": "direct_breakout_live_v1",
         "type": "scanner",
+        "api_key_var": "ACCOUNT_1_API_KEY",
+        "secret_key_var": "ACCOUNT_1_SECRET_KEY",
+        "paper_var": "ACCOUNT_1_PAPER",
     },
     "Pullback Reclaim": {
         "dir": BOT1_DIR,
@@ -43,6 +46,9 @@ BOTS = {
         "strategy": "pullback_reclaim_v1",
         "model": "direct_pullback_live_v1",
         "type": "scanner",
+        "api_key_var": "ACCOUNT_1_API_KEY",
+        "secret_key_var": "ACCOUNT_1_SECRET_KEY",
+        "paper_var": "ACCOUNT_1_PAPER",
     },
     "HA 100 EMA Doji": {
         "dir": BOT2_DIR,
@@ -53,6 +59,9 @@ BOTS = {
         "strategy": "ha_100ema_doji_v1",
         "model": "tv_ha_100ema_doji_live_v1",
         "type": "webhook",
+        "api_key_var": "ACCOUNT_2_API_KEY",
+        "secret_key_var": "ACCOUNT_2_SECRET_KEY",
+        "paper_var": "ACCOUNT_2_PAPER",
     },
     "Alligator Trend": {
         "dir": BOT3_DIR,
@@ -63,6 +72,9 @@ BOTS = {
         "strategy": "alligator_trend_v1",
         "model": "alligator_live_v1",
         "type": "webhook",
+        "api_key_var": "ACCOUNT_3_API_KEY",
+        "secret_key_var": "ACCOUNT_3_SECRET_KEY",
+        "paper_var": "ACCOUNT_3_PAPER",
     },
 }
 
@@ -167,33 +179,55 @@ def get_last_event(df: pd.DataFrame):
     return df["_dt"].dropna().max().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def load_alpaca_account(env_path: Path):
-    if TradingClient is None or dotenv_values is None or not env_path.exists():
-        return None, "Missing alpaca-py/python-dotenv or .env file"
+def get_alpaca_client(bot_info: dict = None):
+    if TradingClient is None:
+        return None, "Missing alpaca-py package"
+
+    key = ""
+    secret = ""
+    paper_text = "true"
+
+    if bot_info:
+        key = os.getenv(bot_info.get("api_key_var", ""), "")
+        secret = os.getenv(bot_info.get("secret_key_var", ""), "")
+        paper_text = os.getenv(bot_info.get("paper_var", ""), "true")
+
+    if (not key or not secret) and dotenv_values is not None and bot_info:
+        env_path = bot_info.get("env")
+        if env_path is not None and env_path.exists():
+            env = dotenv_values(env_path)
+            key = env.get("ALPACA_API_KEY", "")
+            secret = env.get("ALPACA_SECRET_KEY", "")
+            paper_text = str(env.get("ALPACA_PAPER", "true"))
+
+    paper = str(paper_text).lower() != "false"
+
+    if not key or not secret:
+        return None, "Missing Alpaca API key/secret"
+
     try:
-        env = dotenv_values(env_path)
-        key = env.get("ALPACA_API_KEY", "")
-        secret = env.get("ALPACA_SECRET_KEY", "")
-        paper = str(env.get("ALPACA_PAPER", "true")).lower() != "false"
-        if not key or not secret:
-            return None, "Missing Alpaca API key/secret"
-        client = TradingClient(api_key=key, secret_key=secret, paper=paper)
+        return TradingClient(api_key=key, secret_key=secret, paper=paper), ""
+    except Exception as e:
+        return None, str(e)
+
+
+def load_alpaca_account(bot_info: dict = None):
+    client, err = get_alpaca_client(bot_info)
+    if client is None:
+        return None, err
+
+    try:
         return client.get_account(), ""
     except Exception as e:
         return None, str(e)
 
 
-def load_alpaca_positions(env_path: Path):
-    if TradingClient is None or dotenv_values is None or not env_path.exists():
-        return [], "Missing alpaca-py/python-dotenv or .env file"
+def load_alpaca_positions(bot_info: dict = None):
+    client, err = get_alpaca_client(bot_info)
+    if client is None:
+        return [], err
+
     try:
-        env = dotenv_values(env_path)
-        key = env.get("ALPACA_API_KEY", "")
-        secret = env.get("ALPACA_SECRET_KEY", "")
-        paper = str(env.get("ALPACA_PAPER", "true")).lower() != "false"
-        if not key or not secret:
-            return [], "Missing Alpaca API key/secret"
-        client = TradingClient(api_key=key, secret_key=secret, paper=paper)
         return client.get_all_positions(), ""
     except Exception as e:
         return [], str(e)
