@@ -598,6 +598,100 @@ def build_v9_recap(realized_df: pd.DataFrame, rejected_df: pd.DataFrame) -> str:
 
     return base + symbol_text + time_text + rej_text + next_steps
 
+def build_ai_recommendations(realized_df: pd.DataFrame, rejected_df: pd.DataFrame) -> pd.DataFrame:
+    recommendations = []
+
+    if not realized_df.empty:
+        symbol_df = build_symbol_intelligence(realized_df)
+        time_df = build_time_of_day_analysis(realized_df)
+
+        if not symbol_df.empty:
+            worst_symbol = symbol_df.sort_values("total_pnl").iloc[0]
+            best_symbol = symbol_df.sort_values("total_pnl", ascending=False).iloc[0]
+
+            recommendations.append({
+                "Priority": "High",
+                "Area": "Symbol Selection",
+                "Finding": f"Worst symbol is {worst_symbol['symbol']} with ${worst_symbol['total_pnl']:.2f} P/L.",
+                "Recommendation": f"Reduce or pause {worst_symbol['symbol']} until more data improves.",
+                "Confidence": "Medium",
+                "Manual Action Needed": "Review losing trades before blocking symbol.",
+            })
+
+            recommendations.append({
+                "Priority": "Medium",
+                "Area": "Symbol Selection",
+                "Finding": f"Best symbol is {best_symbol['symbol']} with ${best_symbol['total_pnl']:.2f} P/L.",
+                "Recommendation": f"Keep tracking {best_symbol['symbol']} as a preferred test symbol.",
+                "Confidence": "Medium",
+                "Manual Action Needed": "Do not increase size yet; collect more trades.",
+            })
+
+        if not time_df.empty:
+            worst_time = time_df.sort_values("total_pnl").iloc[0]
+            best_time = time_df.sort_values("total_pnl", ascending=False).iloc[0]
+
+            recommendations.append({
+                "Priority": "High",
+                "Area": "Time of Day",
+                "Finding": f"Weakest window is {worst_time['time_bucket']} with ${worst_time['total_pnl']:.2f} P/L.",
+                "Recommendation": f"Consider blocking or reducing trades during {worst_time['time_bucket']}.",
+                "Confidence": "Medium",
+                "Manual Action Needed": "Confirm sample size before changing bot rules.",
+            })
+
+            recommendations.append({
+                "Priority": "Medium",
+                "Area": "Time of Day",
+                "Finding": f"Best window is {best_time['time_bucket']} with ${best_time['total_pnl']:.2f} P/L.",
+                "Recommendation": f"Favor monitoring trades during {best_time['time_bucket']}.",
+                "Confidence": "Medium",
+                "Manual Action Needed": "Do not change sizing yet.",
+            })
+
+        if "quality_grade" in realized_df.columns:
+            low_quality = realized_df[realized_df["quality_grade"].isin(["D", "F"])]
+
+            if not low_quality.empty:
+                recommendations.append({
+                    "Priority": "High",
+                    "Area": "Trade Quality",
+                    "Finding": f"{len(low_quality)} trades graded D/F.",
+                    "Recommendation": "Review lowest-quality trades in Trade Replay before changing strategy rules.",
+                    "Confidence": "High",
+                    "Manual Action Needed": "Inspect entries, exits, time window, and symbol.",
+                })
+
+    if not rejected_df.empty:
+        reason_col = "reason" if "reason" in rejected_df.columns else "message" if "message" in rejected_df.columns else None
+
+        if reason_col:
+            temp = rejected_df.copy()
+            temp["rejection_class"] = temp[reason_col].apply(classify_rejection)
+            top_class = temp["rejection_class"].value_counts().idxmax()
+            top_count = int(temp["rejection_class"].value_counts().max())
+
+            recommendations.append({
+                "Priority": "High",
+                "Area": "Rejected Orders",
+                "Finding": f"Top rejection class is {top_class} with {top_count} occurrences.",
+                "Recommendation": "Fix the largest rejection category before optimizing strategy settings.",
+                "Confidence": "High",
+                "Manual Action Needed": "Review Rejection Intelligence tab.",
+            })
+
+    if not recommendations:
+        recommendations.append({
+            "Priority": "Low",
+            "Area": "Data Collection",
+            "Finding": "Not enough usable data yet.",
+            "Recommendation": "Keep bots running in paper mode and collect more trades.",
+            "Confidence": "High",
+            "Manual Action Needed": "No strategy changes yet.",
+        })
+
+    return pd.DataFrame(recommendations)
+
 
 
 def run_closed_trade_sync():
@@ -676,6 +770,7 @@ tabs = st.tabs([
     "Realized P/L",
     "Trade Replay",
     "Daily AI Recap",
+    "AI Recommendations",
     "Strategy Scoring",
     "Symbol Intelligence",
     "Time of Day",
@@ -796,6 +891,24 @@ with tabs[5]:
     st.text_area("Daily Recap", recap, height=260)
 
 with tabs[6]:
+    st.header("AI Recommendations")
+
+    st.warning(
+        "These are recommendations only. Do not auto-change bot rules without reviewing the data first."
+    )
+
+    rec_df = build_ai_recommendations(realized_df, rejected_df)
+
+    st.dataframe(rec_df, width="stretch")
+
+    high_priority = rec_df[rec_df["Priority"] == "High"]
+
+    if not high_priority.empty:
+        st.subheader("High Priority Actions")
+        for _, row in high_priority.iterrows():
+            st.write(f"**{row['Area']}** — {row['Recommendation']}")
+
+with tabs[7]:
     st.header("Strategy Scoring / Grading")
     score_rows = []
     if not realized_df.empty:
@@ -839,7 +952,7 @@ with tabs[6]:
     st.dataframe(pd.DataFrame(score_rows).sort_values("Activity Score", ascending=False), use_container_width=True)
 
 
-with tabs[7]:
+with tabs[8]:
     st.header("Symbol Intelligence")
 
     symbol_df = build_symbol_intelligence(realized_df)
@@ -859,7 +972,7 @@ with tabs[7]:
         st.bar_chart(symbol_df.set_index("symbol")[["total_pnl", "avg_pnl"]])
 
 
-with tabs[8]:
+with tabs[9]:
     st.header("Time-of-Day Analysis")
 
     time_df = build_time_of_day_analysis(realized_df)
@@ -875,7 +988,7 @@ with tabs[8]:
         )
 
 
-with tabs[9]:
+with tabs[10]:
     st.header("Rejection Intelligence")
 
     if rejected_df.empty:
@@ -901,7 +1014,7 @@ with tabs[9]:
             st.dataframe(rejected_df, use_container_width=True)
 
 
-with tabs[10]:
+with tabs[11]:
     st.header("Strategy Heatmap")
 
     heat = build_strategy_heatmap(realized_df)
@@ -914,7 +1027,7 @@ with tabs[10]:
         st.line_chart(heat)
 
 
-with tabs[11]:
+with tabs[12]:
     st.header("Rejected Orders Diagnostics")
     if rejected_df.empty:
         st.success("No rejected orders found.")
@@ -928,7 +1041,7 @@ with tabs[11]:
         st.subheader("Rejected Details")
         st.dataframe(rejected_df.tail(300), use_container_width=True)
 
-with tabs[12]:
+with tabs[13]:
     st.header("Railway-Aware Bot Health")
 
     st.info(
