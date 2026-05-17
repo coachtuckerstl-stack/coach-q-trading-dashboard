@@ -709,10 +709,10 @@ def build_weekly_review(realized_df: pd.DataFrame) -> pd.DataFrame:
     if "exit_time" not in df.columns:
         return pd.DataFrame()
 
-    df["exit_time"] = pd.to_datetime(df["exit_time"], errors="coerce")
+    df["exit_time"] = pd.to_datetime(df["exit_time"], errors="coerce", utc=True)
     df = df.dropna(subset=["exit_time"])
 
-    last_week = datetime.now() - timedelta(days=7)
+    last_week = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=7)
     df = df[df["exit_time"] >= last_week]
 
     if df.empty:
