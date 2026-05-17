@@ -278,8 +278,14 @@ def pair_realized_trades(closed_df: pd.DataFrame) -> pd.DataFrame:
             open_lots[symbol] = []
 
         if "buy" in side:
-            open_lots[symbol].append({"qty": qty, "price": price, "time": filled_at})
-            continue
+            open_lots[symbol].append({
+                "qty": qty,
+                "price": price,
+                "time": filled_at,
+                "bot_group": row.get("bot_group", ""),
+                "strategy": row.get("strategy", ""),
+                "model": row.get("model", ""),
+})
 
         if "sell" in side:
             remaining = qty
@@ -292,7 +298,9 @@ def pair_realized_trades(closed_df: pd.DataFrame) -> pd.DataFrame:
                 duration_min = (filled_at - lot["time"]).total_seconds() / 60 if pd.notna(filled_at) and pd.notna(lot["time"]) else None
 
                 realized.append({
-                    "symbol": symbol,
+                    "bot_group": lot.get("bot_group", ""),
+                    "strategy": lot.get("strategy", ""),
+                    "model": lot.get("model", ""),"symbol": symbol,
                     "qty": matched_qty,
                     "entry_time": lot["time"],
                     "exit_time": filled_at,
