@@ -444,7 +444,7 @@ def build_time_of_day_analysis(realized_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = realized_df.copy()
-    df["exit_time"] = pd.to_datetime(df["exit_time"], errors="coerce")
+    df["exit_time"] = pd.to_datetime(df["exit_time"], errors="coerce", utc=True).dt.tz_convert(None)
     df = df.dropna(subset=["exit_time"])
     if df.empty:
         return pd.DataFrame()
