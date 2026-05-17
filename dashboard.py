@@ -929,21 +929,87 @@ with tabs[11]:
         st.dataframe(rejected_df.tail(300), use_container_width=True)
 
 with tabs[12]:
-    st.header("Bot Health")
+    st.header("Railway-Aware Bot Health")
+
+    st.info(
+        "This checks live Alpaca API access from Railway variables instead of local Windows folders."
+    )
+
     health_rows = []
+
     for name, info in BOTS.items():
-        df = bot_data[name]
-        health_rows.append({
-            "Strategy": name,
-            "Folder Exists": info["dir"].exists(),
-            "Unified Log Exists": info["log"].exists(),
-            "Old Log Exists": info.get("old_log", Path("")).exists(),
-            ".env Exists": info["env"].exists(),
-            "Rows Loaded": len(df),
-            "Last Event": get_last_event(df),
-            "Type": info.get("type", ""),
-        })
-    st.dataframe(pd.DataFrame(health_rows), use_container_width=True)
+        account, account_err = load_alpaca_account(info)
+        positions, positions_err = load_alpaca_positions(info)
+
+        api_ok = account is not None
+        positions_ok = positions_err == ""
+
+        last_event = get_last_event(bot_data.get(name, pd.DataFrame()))
+
+        if api_ok:
+            equity = float(account.equity)
+            cash = float(account.cash)
+            buying_power = float(account.buying_power)
+            account_status = str(account.status)
+        else:
+            equity = 0.0
+            cash = 0.0
+            buying_power = 0.0
+            account_status = account_err
+
+        health_rows.append(
+            {
+                "Strategy": name,
+                "Bot Group": info.get("bot_group", ""),
+                "API Connected": api_ok,
+                "Positions Connected": positions_ok,
+                "Open Positions": len(positions),
+                "Account Status": account_status,
+                "Equity": round(equity, 2),
+                "Cash": round(cash, 2),
+                "Buying Power": round(buying_power, 2),
+                "Last Log Event": last_event,
+                "Bot Type": info.get("type", ""),
+            }
+        )
+
+    health_df = pd.DataFrame(health_rows)
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Accounts Connected",
+        int(health_df["API Connected"].sum()) if not health_df.empty else 0,
+    )
+
+    c2.metric(
+        "Total Open Positions",
+        int(health_df["Open Positions"].sum()) if not health_df.empty else 0,
+    )
+
+    c3.metric(
+        "Total Buying Power",
+        f"${health_df['Buying Power'].sum():,.2f}" if not health_df.empty else "$0.00",
+    )
+
+    c4.metric(
+        "Health Rows",
+        len(health_df),
+    )
+
+    st.subheader("Account / API Health")
+    st.dataframe(health_df, width="stretch")
+
+    st.subheader("Health Notes")
+    st.write(
+        "- API Connected means Railway can authenticate to that Alpaca paper account."
+    )
+    st.write(
+        "- Positions Connected means Railway can pull open positions from that account."
+    )
+    st.write(
+        "- Last Log Event still depends on available CSV/log data."
+    )
 
 with tabs[13]:
     st.header("Daily Reports")
