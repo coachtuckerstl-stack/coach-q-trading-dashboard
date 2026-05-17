@@ -692,6 +692,63 @@ def build_ai_recommendations(realized_df: pd.DataFrame, rejected_df: pd.DataFram
 
     return pd.DataFrame(recommendations)
 
+def build_weekly_review(realized_df: pd.DataFrame) -> pd.DataFrame:
+    if realized_df.empty:
+        return pd.DataFrame()
+
+    df = realized_df.copy()
+
+    if "exit_time" not in df.columns:
+        return pd.DataFrame()
+
+    df["exit_time"] = pd.to_datetime(df["exit_time"], errors="coerce")
+    df = df.dropna(subset=["exit_time"])
+
+    last_week = datetime.now() - timedelta(days=7)
+    df = df[df["exit_time"] >= last_week]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    summary = []
+
+    for strategy in df["strategy"].dropna().unique():
+        s = df[df["strategy"] == strategy]
+
+        trades = len(s)
+        pnl = s["realized_pnl"].sum()
+        avg_pnl = s["realized_pnl"].mean()
+
+        wins = (s["realized_pnl"] > 0).sum()
+        losses = (s["realized_pnl"] < 0).sum()
+
+        win_rate = round((wins / trades) * 100, 2) if trades else 0
+
+        best_trade = s["realized_pnl"].max()
+        worst_trade = s["realized_pnl"].min()
+
+        quality_avg = (
+            s["quality_score"].mean()
+            if "quality_score" in s.columns
+            else 0
+        )
+
+        summary.append({
+            "Strategy": strategy,
+            "Trades": trades,
+            "Win Rate %": win_rate,
+            "Total P/L": round(pnl, 2),
+            "Average Trade": round(avg_pnl, 2),
+            "Best Trade": round(best_trade, 2),
+            "Worst Trade": round(worst_trade, 2),
+            "Average Quality Score": round(quality_avg, 2),
+        })
+
+    return pd.DataFrame(summary).sort_values(
+        "Total P/L",
+        ascending=False
+    )
+
 
 
 def run_closed_trade_sync():
@@ -771,6 +828,7 @@ tabs = st.tabs([
     "Trade Replay",
     "Daily AI Recap",
     "AI Recommendations",
+    "Weekly Review",
     "Strategy Scoring",
     "Symbol Intelligence",
     "Time of Day",
@@ -909,6 +967,42 @@ with tabs[6]:
             st.write(f"**{row['Area']}** — {row['Recommendation']}")
 
 with tabs[7]:
+    st.header("Weekly Strategy Review")
+
+    weekly_df = build_weekly_review(realized_df)
+
+    if weekly_df.empty:
+        st.warning("Not enough weekly trade data yet.")
+    else:
+        st.subheader("7-Day Strategy Performance")
+        st.dataframe(weekly_df, width="stretch")
+
+        st.bar_chart(
+            weekly_df.set_index("Strategy")["Total P/L"]
+        )
+
+        best = weekly_df.iloc[0]
+        worst = weekly_df.sort_values("Total P/L").iloc[0]
+
+        c1, c2 = st.columns(2)
+
+        c1.metric(
+            "Best Weekly Strategy",
+            best["Strategy"],
+            f"${best['Total P/L']:.2f}",
+        )
+
+        c2.metric(
+            "Worst Weekly Strategy",
+            worst["Strategy"],
+            f"${worst['Total P/L']:.2f}",
+        )
+
+        st.info(
+            "Use weekly data before making major strategy changes. Daily data alone is often noisy."
+        )
+
+with tabs[8]:
     st.header("Strategy Scoring / Grading")
     score_rows = []
     if not realized_df.empty:
@@ -952,7 +1046,7 @@ with tabs[7]:
     st.dataframe(pd.DataFrame(score_rows).sort_values("Activity Score", ascending=False), use_container_width=True)
 
 
-with tabs[8]:
+with tabs[9]:
     st.header("Symbol Intelligence")
 
     symbol_df = build_symbol_intelligence(realized_df)
@@ -972,7 +1066,7 @@ with tabs[8]:
         st.bar_chart(symbol_df.set_index("symbol")[["total_pnl", "avg_pnl"]])
 
 
-with tabs[9]:
+with tabs[10]:
     st.header("Time-of-Day Analysis")
 
     time_df = build_time_of_day_analysis(realized_df)
@@ -988,7 +1082,7 @@ with tabs[9]:
         )
 
 
-with tabs[10]:
+with tabs[11]:
     st.header("Rejection Intelligence")
 
     if rejected_df.empty:
@@ -1014,7 +1108,7 @@ with tabs[10]:
             st.dataframe(rejected_df, use_container_width=True)
 
 
-with tabs[11]:
+with tabs[12]:
     st.header("Strategy Heatmap")
 
     heat = build_strategy_heatmap(realized_df)
@@ -1027,7 +1121,7 @@ with tabs[11]:
         st.line_chart(heat)
 
 
-with tabs[12]:
+with tabs[13]:
     st.header("Rejected Orders Diagnostics")
     if rejected_df.empty:
         st.success("No rejected orders found.")
@@ -1041,7 +1135,7 @@ with tabs[12]:
         st.subheader("Rejected Details")
         st.dataframe(rejected_df.tail(300), use_container_width=True)
 
-with tabs[13]:
+with tabs[14]:
     st.header("Railway-Aware Bot Health")
 
     st.info(
