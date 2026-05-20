@@ -17,13 +17,6 @@ except Exception:
 OUTPUT_FILE = Path("closed_trades.csv")
 
 
-LOCAL_ENV_PATHS = [
-    Path(r"C:\Users\RodgerTucker\alpaca-bot\.env"),
-    Path(r"C:\Users\RodgerTucker\tradingview-alpaca-bot\.env"),
-    Path(r"C:\Users\RodgerTucker\alligator-alpaca-bot\.env"),
-]
-
-
 def safe_value(value):
     if value is None:
         return ""
@@ -50,7 +43,6 @@ def get_clients_from_railway_env():
     """
     clients = []
 
-    # Multi-account setup
     for i in range(1, 6):
         name = os.getenv(f"ACCOUNT_{i}_NAME", f"Account {i}")
         key = os.getenv(f"ACCOUNT_{i}_API_KEY")
@@ -63,7 +55,6 @@ def get_clients_from_railway_env():
                 "client": TradingClient(key, secret, paper=paper),
             })
 
-    # Single-account fallback
     key = os.getenv("ALPACA_API_KEY")
     secret = os.getenv("ALPACA_SECRET_KEY")
     paper = env_bool("ALPACA_PAPER", True)
