@@ -1,7 +1,9 @@
 import os
 import subprocess
 import sys
-from datetime import datetime
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -19,9 +21,9 @@ except Exception:
     text = None
 
 
-# ============================================================
+
 # Page Setup
-# ============================================================
+
 
 st.set_page_config(page_title="Trading Ops Center V9", layout="wide")
 
@@ -29,10 +31,14 @@ DATA_START_DATE = pd.Timestamp("2026-05-19", tz="UTC")
 DATA_START_DATE_LABEL = "05/19/2026"
 
 
-# ============================================================
 # Strategy / Account Config
 # Railway-safe: no Windows C:\ paths required.
-# ============================================================
+
+
+STRATEGY5_DAILY_PNL_URL = os.getenv(
+    "STRATEGY5_DAILY_PNL_URL",
+    "https://web-production-ab0c0.up.railway.app/daily-pnl",
+)
 
 BOTS = {
     "Breakout Momentum": {
@@ -98,9 +104,9 @@ BOTS = {
 }
 
 
-# ============================================================
+
 # General Helpers
-# ============================================================
+
 
 def env_bool(name: str, default: bool = True) -> bool:
     value = os.getenv(name)
@@ -264,9 +270,9 @@ def get_last_event(df: pd.DataFrame):
     return df["_dt"].dropna().max().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ============================================================
+
 # Alpaca Helpers
-# ============================================================
+
 
 def get_alpaca_client(bot_info: dict | None = None):
     if TradingClient is None:
@@ -364,9 +370,8 @@ def load_unique_open_positions() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ============================================================
 # Closed Trade Sync / Load
-# ============================================================
+
 
 def run_closed_trade_sync():
     """
@@ -518,9 +523,8 @@ def pair_realized_trades(closed_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(realized)
 
 
-# ============================================================
 # Strategy 5 / Postgres Optional Load
-# ============================================================
+
 
 def get_database_engine():
     if create_engine is None:
@@ -582,9 +586,9 @@ def load_strategy5_events() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# ============================================================
+
 # Reporting Helpers
-# ============================================================
+
 
 def grade_trade(pnl: float, pnl_pct: float) -> str:
     if pnl > 0 and pnl_pct >= 1:
@@ -1105,9 +1109,8 @@ def build_v9_recap(realized_df: pd.DataFrame, rejected_df: pd.DataFrame) -> str:
     return base + symbol_text + time_text + rej_text + next_steps
 
 
-# ============================================================
 # Load Data
-# ============================================================
+
 
 auto_sync_once_on_open()
 
@@ -1152,9 +1155,8 @@ for name, df in bot_data.items():
 rejected_df = pd.concat(rejected_parts, ignore_index=True, sort=False) if rejected_parts else pd.DataFrame()
 
 
-# ============================================================
 # Sidebar / Header
-# ============================================================
+
 
 st.sidebar.title("Ops Controls")
 st.sidebar.caption("Railway dashboard syncs automatically on open and when Refresh Dashboard is clicked.")
@@ -1168,6 +1170,24 @@ if "last_sync_time" in st.session_state:
     with st.sidebar.expander("Last sync message"):
         st.code(st.session_state.get("last_sync_msg", ""))
 
+def fetch_strategy5_daily_pnl():
+    try:
+        with urllib.request.urlopen(STRATEGY5_DAILY_PNL_URL, timeout=8) as response:
+            raw = response.read().decode("utf-8")
+            data = json.loads(raw)
+
+        if not data.get("ok"):
+            return None, data.get("error", "Strategy 5 daily P/L endpoint returned ok=false")
+
+        return data.get("summary", {}), None
+
+    except urllib.error.URLError as exc:
+        return None, f"Could not reach Strategy 5 daily P/L endpoint: {exc}"
+
+    except Exception as exc:
+        return None, f"Could not load Strategy 5 daily P/L: {exc}"
+
+
 st.title("Trading Operations Center V9")
 st.caption(f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 st.info(f"Dashboard is filtering all report data from {DATA_START_DATE_LABEL} forward.")
@@ -1178,9 +1198,9 @@ if st.button("Refresh Dashboard"):
     st.rerun()
 
 
-# ============================================================
+
 # Tabs
-# ============================================================
+
 
 tabs = st.tabs([
     "Command Center",
@@ -1207,6 +1227,32 @@ tabs = st.tabs([
 
 with tabs[0]:
     st.header("Command Center")
+
+    strategy5_summary, strategy5_error = fetch_strategy5_daily_pnl()
+
+    if strategy5_summary:
+        st.subheader("Strategy 5 Today")
+
+        s5_c1, s5_c2, s5_c3, s5_c4 = st.columns(4)
+
+        realized_pnl = float(strategy5_summary.get("realized_pnl") or 0)
+        closed_trades = int(strategy5_summary.get("closed_trades") or 0)
+        win_rate = float(strategy5_summary.get("win_rate") or 0)
+        open_trades = int(strategy5_summary.get("open_trades") or 0)
+        open_symbols = strategy5_summary.get("open_symbols") or []
+
+        s5_c1.metric("S5 Daily P/L", f"${realized_pnl:,.2f}")
+        s5_c2.metric("S5 Closed Trades", closed_trades)
+        s5_c3.metric("S5 Win Rate", f"{win_rate:.1f}%")
+        s5_c4.metric("S5 Open Trades", open_trades)
+
+        if open_symbols:
+            st.caption("S5 Open Symbols: " + ", ".join(open_symbols))
+
+    else:
+        st.warning(f"Strategy 5 daily P/L unavailable: {strategy5_error}")
+
+    st.divider()
 
     rows = []
     for name, df in bot_data.items():
