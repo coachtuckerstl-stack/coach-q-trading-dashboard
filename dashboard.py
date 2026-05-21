@@ -25,6 +25,9 @@ except Exception:
 
 st.set_page_config(page_title="Trading Ops Center V9", layout="wide")
 
+DATA_START_DATE = pd.Timestamp("2026-05-19", tz="UTC")
+DATA_START_DATE_LABEL = "05/19/2026"
+
 
 # ============================================================
 # Strategy / Account Config
@@ -179,6 +182,48 @@ def parse_datetime_column(df: pd.DataFrame) -> pd.DataFrame:
             return df
 
     df["_dt"] = pd.NaT
+    return df
+
+
+def filter_from_start_date(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keeps only rows from DATA_START_DATE forward.
+    Uses the first available date/time column it can find.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    possible_cols = [
+        "timestamp_et",
+        "timestamp",
+        "filled_at",
+        "submitted_at",
+        "synced_at",
+        "exit_time",
+        "entry_time",
+        "created_at",
+        "date_et",
+        "date",
+    ]
+
+    date_col = None
+
+    for col in possible_cols:
+        if col in df.columns:
+            date_col = col
+            break
+
+    if date_col is None:
+        return df
+
+    parsed = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+
+    df["_filter_dt"] = parsed
+    df = df[df["_filter_dt"] >= DATA_START_DATE]
+    df = df.drop(columns=["_filter_dt"], errors="ignore")
+
     return df
 
 
@@ -385,7 +430,7 @@ def load_closed_trades() -> pd.DataFrame:
         if "source_env" in df.columns:
             df["source_env"] = df["source_env"].astype(str)
 
-    return df
+    return filter_from_start_date(df)
 
 
 def pair_realized_trades(closed_df: pd.DataFrame) -> pd.DataFrame:
@@ -524,7 +569,7 @@ def load_strategy5_events() -> pd.DataFrame:
     """
     pg_df = load_strategy5_events_from_postgres()
     if not pg_df.empty:
-        return pg_df
+        return filter_from_start_date(pg_df)
 
     for path in [Path("strategy5_log.csv"), Path("strategy5_trades.csv"), Path("unified_trade_log.csv")]:
         df = load_log(path)
@@ -532,7 +577,7 @@ def load_strategy5_events() -> pd.DataFrame:
             if "strategy" in df.columns:
                 mask = df["strategy"].astype(str).str.contains("strategy_5|orb_vwap", case=False, na=False)
                 df = df[mask]
-            return df
+            return filter_from_start_date(df)
 
     return pd.DataFrame()
 
@@ -1077,6 +1122,8 @@ for name, info in BOTS.items():
     if info.get("type") == "simulator" and df.empty:
         df = load_strategy5_events()
 
+    df = filter_from_start_date(df)
+
     bot_data[name] = df
 
 closed_trades_df = load_closed_trades()
@@ -1123,6 +1170,7 @@ if "last_sync_time" in st.session_state:
 
 st.title("Trading Operations Center V9")
 st.caption(f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.info(f"Dashboard is filtering all report data from {DATA_START_DATE_LABEL} forward.")
 
 if st.button("Refresh Dashboard"):
     with st.spinner("Syncing Railway trade history and refreshing dashboard..."):
