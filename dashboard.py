@@ -104,14 +104,14 @@ BOTS = {
     },
     "Strategy 6 Forex": {
         "bot_group": "STRATEGY_6",
-        "strategy": "strategy_6_forex_top_down",
-        "model": "development_not_running",
+        "strategy": "strategy_6b_v2_forex_portfolio_candidate",
+        "model": "locked_forward_validation_v1",
         "type": "development",
         "api_key_var": "",
         "secret_key_var": "",
         "paper_var": "",
         "account_name_var": "",
-        "log": Path("strategy6_forex_log.csv"),
+        "log": Path("strategy6_forward_validation_log.csv"),
         "old_log": Path("strategy6_forex_backtests.csv"),
     },
 }
@@ -122,8 +122,51 @@ STRATEGY_META = {
     "HA 100 EMA Doji": {"number": "Strategy 3", "market": "Stocks", "mode": "Paper", "status": "Testing"},
     "Alligator Trend": {"number": "Strategy 4", "market": "Stocks", "mode": "Paper", "status": "Testing"},
     "Strategy 5 VWAP Reclaim Simulator": {"number": "Strategy 5", "market": "Stocks", "mode": "Simulation", "status": "Running"},
-    "Strategy 6 Forex": {"number": "Strategy 6", "market": "Forex", "mode": "Development", "status": "Not Running"},
+    "Strategy 6 Forex": {"number": "Strategy 6", "market": "Forex Portfolio", "mode": "Forward Validation", "status": "Candidate"},
 }
+
+
+STRATEGY6_CANDIDATE = {
+    "name": "Strategy 6B V2 Candidate — Active Session Portfolio",
+    "status": "Candidate / Forward Validation",
+    "live_trading": "Disabled",
+    "pairs": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURJPY", "GBPJPY"],
+    "session": "12:00–21:00 UTC",
+    "confirmation": "15M Engulfing only",
+    "direction_rule": "Weekly and Daily structure must agree",
+    "entry_zone": "Daily Area of Interest; confirmation must close through AOI midpoint",
+    "stop_rule": "Beyond AOI using greater of 3 pips or 0.5 × 15M ATR",
+    "target": "2R",
+    "estimated_cost": "0.8 pip per trade",
+    "validation_goal": 30,
+    "preferred_validation_goal": 50,
+}
+
+STRATEGY6_KNOWN_HISTORY = {
+    "trades": 66,
+    "net_pnl": 364.34,
+    "net_r": 18.22,
+    "win_rate": 43.94,
+    "profit_factor": 1.469,
+    "max_drawdown": 110.22,
+    "period": "2025-01-01 through 2026-04-10",
+}
+
+STRATEGY6_FORWARD_COLUMNS = [
+    "signal_date_utc",
+    "pair",
+    "direction",
+    "entry_time_utc",
+    "entry_price",
+    "stop_price",
+    "target_price",
+    "exit_time_utc",
+    "exit_price",
+    "result",
+    "net_r",
+    "pnl_dollars",
+    "notes",
+]
 
 
 
@@ -1215,6 +1258,8 @@ def get_daily_pnl_for_strategy(strategy_name, strategy5_summary):
     info = BOTS.get(strategy_name, {})
 
     if info.get("type") == "development":
+        if strategy_name == "Strategy 6 Forex":
+            return None, "Forward validation / live disabled"
         return None, "Development / no trades"
 
     if info.get("type") == "simulator":
@@ -1318,7 +1363,7 @@ tabs = st.tabs([
     "Bot Health",
     "Daily Reports",
     "Raw Logs",
-    "Strategy 6 Forex",
+    "Strategy 6 Forward Test",
 ])
 
 
@@ -1411,8 +1456,8 @@ with tabs[0]:
     st.dataframe(status_df, use_container_width=True)
 
     st.info(
-        "Strategy 6 Forex is now included in Coach T as Development / Not Running. "
-        "Its panel is ready for TradingView backtest files and future signal testing."
+        "Strategy 6 Forex Portfolio is now listed as Candidate / Forward Validation. "
+        "Its locked rules are being tracked without live trading or rule changes during validation."
     )
 
 with tabs[1]:
@@ -1860,7 +1905,7 @@ with tabs[16]:
     st.write("- API Connected means Railway can authenticate to that Alpaca paper account.")
     st.write("- Positions Connected means Railway can pull open positions from that account.")
     st.write("- Strategy 5 is a simulator loaded from shared Postgres trade_events.")
-    st.write("- Strategy 6 Forex is intentionally listed as Development / Not Running until testing is stable.")
+    st.write("- Strategy 6 Forex Portfolio is intentionally live-disabled while the locked candidate is forward validated.")
     st.write("- Breakout Momentum and Pullback Reclaim are separate strategies sharing one Alpaca account; that account is counted once in totals.")
 
 
@@ -1952,31 +1997,149 @@ with tabs[18]:
 
 
 with tabs[19]:
-    st.header("Strategy 6 — Forex Development")
-    st.info("Status: Development / Not Running. No live or simulated trading is enabled for Strategy 6 yet.")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Market", "Forex")
-    c2.metric("Testing Pair", "EURUSD")
-    c3.metric("Current Mode", "Development")
-    c4.metric("Live Signals", "Disabled")
-
-    st.subheader("Current Strategy Concept")
-    st.write(
-        "Top-down market structure review using higher timeframes, "
-        "with an engulfing-candle entry concept on the lower timeframe."
+    st.header("Strategy 6 — Forex Portfolio Forward Validation")
+    st.warning(
+        "Status: Candidate / Forward Validation. Live trading is disabled. "
+        "The strategy rules are locked during the validation sample."
     )
 
-    st.subheader("Development Checklist")
-    st.checkbox("Confirm final multi-timeframe entry rules", value=False, disabled=True)
-    st.checkbox("Produce acceptable TradingView backtest results", value=False, disabled=True)
-    st.checkbox("Choose risk and session limits", value=False, disabled=True)
-    st.checkbox("Connect alerts to a simulator only", value=False, disabled=True)
-    st.checkbox("Approve for paper testing", value=False, disabled=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Market", "Forex Portfolio")
+    c2.metric("Pairs Tracked", len(STRATEGY6_CANDIDATE["pairs"]))
+    c3.metric("Current Mode", "Forward Validation")
+    c4.metric("Live Trading", STRATEGY6_CANDIDATE["live_trading"])
 
-    strategy6_df = bot_data.get("Strategy 6 Forex", pd.DataFrame())
-    if strategy6_df.empty:
-        st.caption("No Strategy 6 data loaded yet. This is expected while the Forex strategy is under development.")
+    st.subheader("Locked Candidate")
+    st.write(f"**{STRATEGY6_CANDIDATE['name']}**")
+    rules_df = pd.DataFrame([
+        {"Rule": "Pairs", "Locked Setting": ", ".join(STRATEGY6_CANDIDATE["pairs"])},
+        {"Rule": "Trading Session", "Locked Setting": STRATEGY6_CANDIDATE["session"]},
+        {"Rule": "Structure Direction", "Locked Setting": STRATEGY6_CANDIDATE["direction_rule"]},
+        {"Rule": "Entry Zone", "Locked Setting": STRATEGY6_CANDIDATE["entry_zone"]},
+        {"Rule": "Confirmation", "Locked Setting": STRATEGY6_CANDIDATE["confirmation"]},
+        {"Rule": "Stop", "Locked Setting": STRATEGY6_CANDIDATE["stop_rule"]},
+        {"Rule": "Target", "Locked Setting": STRATEGY6_CANDIDATE["target"]},
+        {"Rule": "Estimated Cost", "Locked Setting": STRATEGY6_CANDIDATE["estimated_cost"]},
+    ])
+    st.dataframe(rules_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Known-History Candidate Benchmark")
+    st.info(
+        "This benchmark helped select the candidate. It is not new forward-test performance "
+        "and should not be mixed with future validation trades."
+    )
+    h1, h2, h3, h4, h5, h6 = st.columns(6)
+    h1.metric("Historical Trades", STRATEGY6_KNOWN_HISTORY["trades"])
+    h2.metric("Historical Net P/L", f"${STRATEGY6_KNOWN_HISTORY['net_pnl']:,.2f}")
+    h3.metric("Historical Net R", f"{STRATEGY6_KNOWN_HISTORY['net_r']:.2f} R")
+    h4.metric("Historical Win Rate", f"{STRATEGY6_KNOWN_HISTORY['win_rate']:.2f}%")
+    h5.metric("Historical Profit Factor", f"{STRATEGY6_KNOWN_HISTORY['profit_factor']:.3f}")
+    h6.metric("Historical Max DD", f"${STRATEGY6_KNOWN_HISTORY['max_drawdown']:,.2f}")
+    st.caption(f"Known-history period: {STRATEGY6_KNOWN_HISTORY['period']}")
+
+    st.divider()
+    st.subheader("Forward Validation Log")
+    st.caption(
+        "Upload future Strategy 6 trade results here as they are recorded. "
+        "The forward sample begins after the candidate was locked and must not include the known-history backtest."
+    )
+
+    blank_template = pd.DataFrame(columns=STRATEGY6_FORWARD_COLUMNS)
+    st.download_button(
+        label="Download Blank Strategy 6 Forward Log Template",
+        data=blank_template.to_csv(index=False).encode("utf-8"),
+        file_name="strategy6_forward_validation_log.csv",
+        mime="text/csv",
+        key="download_strategy6_forward_template",
+    )
+
+    strategy6_upload = st.file_uploader(
+        "Upload Strategy 6 forward validation CSV",
+        type=["csv"],
+        key="strategy6_forward_validation_upload",
+    )
+
+    strategy6_existing_path = Path("strategy6_forward_validation_log.csv")
+    forward_df = pd.DataFrame()
+
+    if strategy6_upload is not None:
+        try:
+            forward_df = pd.read_csv(strategy6_upload)
+            st.success("Uploaded forward-validation log loaded for review.")
+        except Exception as exc:
+            st.error(f"Could not read uploaded forward-validation log: {exc}")
+    elif strategy6_existing_path.exists():
+        forward_df = load_log(strategy6_existing_path)
+        if not forward_df.empty:
+            st.caption("Loaded strategy6_forward_validation_log.csv from the dashboard service files.")
+
+    if forward_df.empty:
+        st.info(
+            "No forward-validation trades have been loaded yet. "
+            f"Keep rules locked until at least {STRATEGY6_CANDIDATE['validation_goal']} new trades are recorded "
+            f"(preferred review point: {STRATEGY6_CANDIDATE['preferred_validation_goal']} trades)."
+        )
     else:
-        st.subheader("Loaded Strategy 6 Data")
-        st.dataframe(strategy6_df.head(500), use_container_width=True)
+        missing_cols = [col for col in STRATEGY6_FORWARD_COLUMNS if col not in forward_df.columns]
+        if missing_cols:
+            st.warning("Forward log is missing expected columns: " + ", ".join(missing_cols))
+
+        for numeric_col in ["net_r", "pnl_dollars"]:
+            if numeric_col in forward_df.columns:
+                forward_df[numeric_col] = pd.to_numeric(forward_df[numeric_col], errors="coerce").fillna(0)
+
+        completed_forward = forward_df.copy()
+        if "result" in completed_forward.columns:
+            completed_forward = completed_forward[
+                completed_forward["result"].astype(str).str.upper().isin(["WIN", "LOSS", "TARGET", "STOP", "CLOSED"])
+            ]
+
+        completed_count = len(completed_forward)
+        pnl = float(completed_forward["pnl_dollars"].sum()) if "pnl_dollars" in completed_forward.columns else 0.0
+        net_r = float(completed_forward["net_r"].sum()) if "net_r" in completed_forward.columns else 0.0
+        wins = int((completed_forward["pnl_dollars"] > 0).sum()) if "pnl_dollars" in completed_forward.columns else 0
+        win_rate = (wins / completed_count * 100) if completed_count else 0.0
+
+        positives = completed_forward.loc[completed_forward.get("pnl_dollars", pd.Series(dtype=float)) > 0, "pnl_dollars"].sum() if "pnl_dollars" in completed_forward.columns else 0.0
+        negatives = abs(completed_forward.loc[completed_forward.get("pnl_dollars", pd.Series(dtype=float)) < 0, "pnl_dollars"].sum()) if "pnl_dollars" in completed_forward.columns else 0.0
+        profit_factor = positives / negatives if negatives else None
+
+        f1, f2, f3, f4, f5 = st.columns(5)
+        f1.metric("Forward Trades", completed_count, f"{completed_count}/{STRATEGY6_CANDIDATE['validation_goal']} minimum")
+        f2.metric("Forward Net P/L", f"${pnl:,.2f}")
+        f3.metric("Forward Net R", f"{net_r:.2f} R")
+        f4.metric("Forward Win Rate", f"{win_rate:.2f}%")
+        f5.metric("Forward Profit Factor", "N/A" if profit_factor is None else f"{profit_factor:.3f}")
+
+        if completed_count < STRATEGY6_CANDIDATE["validation_goal"]:
+            st.warning(
+                f"Continue collecting trades. Only {completed_count} of "
+                f"{STRATEGY6_CANDIDATE['validation_goal']} minimum forward-validation trades are recorded."
+            )
+        elif completed_count < STRATEGY6_CANDIDATE["preferred_validation_goal"]:
+            st.info("Minimum review sample reached. Keep collecting toward the preferred 50-trade review before deployment decisions.")
+        else:
+            st.success("Preferred forward-validation sample size reached. Review performance before any paper-trading decision.")
+
+        st.dataframe(forward_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            label="Download Reviewed Strategy 6 Forward Log",
+            data=forward_df.to_csv(index=False).encode("utf-8"),
+            file_name="strategy6_forward_validation_log_reviewed.csv",
+            mime="text/csv",
+            key="download_strategy6_forward_review",
+        )
+
+    st.subheader("Validation Rules")
+    st.checkbox("Candidate rules locked", value=True, disabled=True)
+    st.checkbox("Nine-pair historical benchmark complete", value=True, disabled=True)
+    st.checkbox("Walk-forward stability review complete", value=True, disabled=True)
+    st.checkbox("Forward sample of 30 new trades complete", value=False, disabled=True)
+    st.checkbox("Forward sample of 50 new trades complete", value=False, disabled=True)
+    st.checkbox("Approved for paper execution", value=False, disabled=True)
+
+    st.info(
+        "Next technical phase: connect a Strategy 6 signal generator/simulator that automatically writes "
+        "new forward-test signals into a persistent database. Until then, this tab is a live-disabled tracking center."
+    )
+
