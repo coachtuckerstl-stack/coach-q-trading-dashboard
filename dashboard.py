@@ -652,6 +652,77 @@ def load_strategy5_events() -> pd.DataFrame:
 
 
 
+def load_strategy6_forward_events_from_postgres() -> pd.DataFrame:
+    """
+    Loads Strategy 6 simulated forward-validation records from the shared Railway Postgres table.
+    Each Strategy 6 trade remains one row and is updated when TradingView sends its exit alert.
+    """
+    engine, err = get_database_engine()
+    if engine is None:
+        return pd.DataFrame()
+
+    try:
+        query = text("""
+            SELECT
+                id,
+                timestamp_et,
+                strategy,
+                bot_name,
+                symbol,
+                side,
+                entry_price,
+                exit_price,
+                stop_loss,
+                take_profit,
+                status,
+                reason,
+                order_id,
+                source,
+                simulation_only,
+                raw_payload,
+                created_at,
+                updated_at
+            FROM trade_events
+            WHERE source = 'strategy_6'
+               OR strategy = 'strategy_6b_v2_forex_portfolio_candidate'
+            ORDER BY created_at DESC, id DESC
+        """)
+        df = pd.read_sql(query, engine)
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    for col in ["entry_price", "exit_price", "stop_loss", "take_profit"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    parsed_metrics = []
+    for raw in df.get("raw_payload", pd.Series(dtype=str)).fillna(""):
+        try:
+            payload = json.loads(raw)
+            parsed_metrics.append(payload.get("forward_metrics", {}))
+        except Exception:
+            parsed_metrics.append({})
+
+    df["net_r"] = [safe_float(item.get("net_r"), None) for item in parsed_metrics]
+    df["pnl_dollars"] = [safe_float(item.get("pnl_dollars"), None) for item in parsed_metrics]
+    df["risk_pips"] = [safe_float(item.get("risk_pips"), None) for item in parsed_metrics]
+    df["gross_r"] = [safe_float(item.get("gross_r"), None) for item in parsed_metrics]
+    df["cost_pips"] = [safe_float(item.get("cost_pips"), None) for item in parsed_metrics]
+
+    df["direction"] = df["side"]
+    df["pair"] = df["symbol"]
+    df["entry_time_utc"] = df["created_at"]
+    df["exit_time_utc"] = df["updated_at"].where(df["exit_price"].notna(), "")
+    df["stop_price"] = df["stop_loss"]
+    df["target_price"] = df["take_profit"]
+    df["result"] = df["status"]
+
+    return df
+
+
+
 # Reporting Helpers
 
 
@@ -2060,12 +2131,22 @@ with tabs[19]:
     )
 
     strategy6_existing_path = Path("strategy6_forward_validation_log.csv")
+    db_forward_df = load_strategy6_forward_events_from_postgres()
     forward_df = pd.DataFrame()
 
-    if strategy6_upload is not None:
+    if not db_forward_df.empty:
+        forward_df = db_forward_df
+        st.success("Forward-validation log loaded automatically from shared Railway Postgres.")
+        st.caption(
+            "This is the live-disabled Strategy 6 validation source of truth. "
+            "Use CSV upload below only for offline/manual review."
+        )
+        if strategy6_upload is not None:
+            st.info("A CSV was uploaded, but Postgres data is displayed because live database records take priority.")
+    elif strategy6_upload is not None:
         try:
             forward_df = pd.read_csv(strategy6_upload)
-            st.success("Uploaded forward-validation log loaded for review.")
+            st.success("Uploaded forward-validation log loaded for offline review; no Postgres Strategy 6 records were found.")
         except Exception as exc:
             st.error(f"Could not read uploaded forward-validation log: {exc}")
     elif strategy6_existing_path.exists():
@@ -2075,7 +2156,9 @@ with tabs[19]:
 
     if forward_df.empty:
         st.info(
-            "No forward-validation trades have been loaded yet. "
+            "No Strategy 6 forward-validation trades are in Postgres yet. "
+            "After the Strategy 6 Railway webhook service and TradingView alerts are connected, "
+            "new simulated trades will appear here automatically. "
             f"Keep rules locked until at least {STRATEGY6_CANDIDATE['validation_goal']} new trades are recorded "
             f"(preferred review point: {STRATEGY6_CANDIDATE['preferred_validation_goal']} trades)."
         )
@@ -2091,7 +2174,10 @@ with tabs[19]:
         completed_forward = forward_df.copy()
         if "result" in completed_forward.columns:
             completed_forward = completed_forward[
-                completed_forward["result"].astype(str).str.upper().isin(["WIN", "LOSS", "TARGET", "STOP", "CLOSED"])
+                completed_forward["result"].astype(str).str.upper().isin([
+                    "WIN", "LOSS", "TARGET", "STOP", "CLOSED",
+                    "TARGET_HIT", "STOP_HIT", "FORWARD_EXIT", "MANUAL_CLOSE"
+                ])
             ]
 
         completed_count = len(completed_forward)
@@ -2139,7 +2225,8 @@ with tabs[19]:
     st.checkbox("Approved for paper execution", value=False, disabled=True)
 
     st.info(
-        "Next technical phase: connect a Strategy 6 signal generator/simulator that automatically writes "
-        "new forward-test signals into a persistent database. Until then, this tab is a live-disabled tracking center."
+        "Strategy 6 is designed to read simulated forward-test signals from shared Railway Postgres. "
+        "Once the Strategy 6 webhook service and TradingView alerts are connected, this panel will update automatically. "
+        "Live broker execution remains disabled."
     )
 
