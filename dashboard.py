@@ -1222,20 +1222,37 @@ def get_daily_pnl_for_strategy(strategy_name, strategy5_summary):
             return safe_float(strategy5_summary.get("realized_pnl"), 0.0), "Simulator endpoint"
         return None, "P/L unavailable"
 
+    account_var = info.get("api_key_var", "")
+    account_strategies = [
+        bot_name for bot_name, bot in BOTS.items()
+        if bot.get("type") not in ("simulator", "development")
+        and bot.get("api_key_var", "") == account_var
+    ]
+    account_name = os.getenv(info.get("account_name_var", ""), "").strip()
+    has_dedicated_account = len(account_strategies) == 1 and bool(account_name)
+
     if realized_df.empty or "realized_pnl" not in realized_df.columns:
-        return None, "No closed trades"
+        if has_dedicated_account:
+            return 0.0, "No closed trades today"
+        return None, "Needs strategy-tagged exits"
 
     temp = realized_df.copy()
     temp["exit_time"] = pd.to_datetime(temp["exit_time"], errors="coerce", utc=True)
     temp = temp.dropna(subset=["exit_time"])
+
     if temp.empty:
-        return None, "No closed trades"
+        if has_dedicated_account:
+            return 0.0, "No closed trades today"
+        return None, "Needs strategy-tagged exits"
 
     today_central = pd.Timestamp.now(tz="America/Chicago").date()
     temp["_local_date"] = temp["exit_time"].dt.tz_convert("America/Chicago").dt.date
     temp = temp[temp["_local_date"] == today_central]
+
     if temp.empty:
-        return 0.0, "No closed trades today"
+        if has_dedicated_account:
+            return 0.0, "No closed trades today"
+        return None, "Needs strategy-tagged exits"
 
     strategy_id = str(info.get("strategy", "")).lower()
     model_id = str(info.get("model", "")).lower()
@@ -1254,22 +1271,14 @@ def get_daily_pnl_for_strategy(strategy_name, strategy5_summary):
         pnl = pd.to_numeric(exact_rows["realized_pnl"], errors="coerce").fillna(0).sum()
         return float(pnl), "Strategy-tagged fills"
 
-    account_var = info.get("api_key_var", "")
-    account_strategies = [
-        bot_name for bot_name, bot in BOTS.items()
-        if bot.get("type") not in ("simulator", "development")
-        and bot.get("api_key_var", "") == account_var
-    ]
-    account_name = os.getenv(info.get("account_name_var", ""), "").strip()
-
-    if len(account_strategies) == 1 and account_name and "source_env" in temp.columns:
+    if has_dedicated_account and "source_env" in temp.columns:
         account_rows = temp[temp["source_env"].astype(str) == account_name]
         if not account_rows.empty:
             pnl = pd.to_numeric(account_rows["realized_pnl"], errors="coerce").fillna(0).sum()
             return float(pnl), "Dedicated Alpaca account"
+        return 0.0, "No closed trades today"
 
     return None, "Needs strategy-tagged exits"
-
 
 def format_daily_pnl(value):
     return "Pending" if value is None else f"${value:,.2f}"
@@ -1758,6 +1767,7 @@ with tabs[16]:
             health_rows.append({
                 "Strategy": name,
                 "Bot Group": info.get("bot_group", ""),
+                "_Account Key": info.get("api_key_var", ""),
                 "API Connected": "N/A",
                 "Positions Connected": "N/A",
                 "Open Positions": 0,
@@ -1776,6 +1786,7 @@ with tabs[16]:
             health_rows.append({
                 "Strategy": name,
                 "Bot Group": info.get("bot_group", ""),
+                "_Account Key": info.get("api_key_var", ""),
                 "API Connected": "N/A",
                 "Positions Connected": "N/A",
                 "Open Positions": 0,
@@ -1809,6 +1820,7 @@ with tabs[16]:
         health_rows.append({
             "Strategy": name,
             "Bot Group": info.get("bot_group", ""),
+            "_Account Key": info.get("api_key_var", ""),
             "API Connected": api_ok,
             "Positions Connected": positions_ok,
             "Open Positions": len(positions),
@@ -1823,20 +1835,33 @@ with tabs[16]:
 
     health_df = pd.DataFrame(health_rows)
 
+    connected_accounts_df = pd.DataFrame()
+    if not health_df.empty:
+        connected_accounts_df = health_df[health_df["API Connected"] == True].copy()
+        connected_accounts_df = connected_accounts_df.drop_duplicates(subset=["_Account Key"])
+
+    unique_accounts_connected = len(connected_accounts_df)
+    unique_buying_power = (
+        pd.to_numeric(connected_accounts_df["Buying Power"], errors="coerce").fillna(0).sum()
+        if not connected_accounts_df.empty else 0.0
+    )
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Accounts Connected", int((health_df["API Connected"] == True).sum()) if not health_df.empty else 0)
+    c1.metric("Unique Alpaca Accounts Connected", unique_accounts_connected)
     c2.metric("Total Open Positions", int(pd.to_numeric(health_df["Open Positions"], errors="coerce").fillna(0).sum()) if not health_df.empty else 0)
-    c3.metric("Total Buying Power", f"${pd.to_numeric(health_df['Buying Power'], errors='coerce').fillna(0).sum():,.2f}" if not health_df.empty else "$0.00")
-    c4.metric("Health Rows", len(health_df))
+    c3.metric("Total Unique Buying Power", f"${unique_buying_power:,.2f}")
+    c4.metric("Strategy Health Rows", len(health_df))
 
     st.subheader("Account / API Health")
-    st.dataframe(health_df, use_container_width=True)
+    display_health_df = health_df.drop(columns=["_Account Key"], errors="ignore")
+    st.dataframe(display_health_df, use_container_width=True)
 
     st.subheader("Health Notes")
     st.write("- API Connected means Railway can authenticate to that Alpaca paper account.")
     st.write("- Positions Connected means Railway can pull open positions from that account.")
     st.write("- Strategy 5 is a simulator loaded from shared Postgres trade_events.")
     st.write("- Strategy 6 Forex is intentionally listed as Development / Not Running until testing is stable.")
+    st.write("- Breakout Momentum and Pullback Reclaim are separate strategies sharing one Alpaca account; that account is counted once in totals.")
 
 
 with tabs[17]:
