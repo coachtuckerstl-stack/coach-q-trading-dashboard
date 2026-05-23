@@ -26,7 +26,7 @@ except Exception:
 # Page Setup
 
 
-st.set_page_config(page_title="Trading Ops Center V9", layout="wide")
+st.set_page_config(page_title="Coach T Trading Command Center", layout="wide")
 
 DATA_START_DATE = pd.Timestamp("2026-05-19", tz="UTC")
 DATA_START_DATE_LABEL = "05/19/2026"
@@ -90,9 +90,9 @@ BOTS = {
         "log": Path("alligator_log.csv"),
         "old_log": Path("trade_log.csv"),
     },
-    "Strategy 5 ORB/VWAP": {
+    "Strategy 5 VWAP Reclaim Simulator": {
         "bot_group": "STRATEGY_5",
-        "strategy": "strategy_5_orb_vwap",
+        "strategy": "strategy_5_simple_vwap_reclaim",
         "model": "strategy5_tradingview_simulator",
         "type": "simulator",
         "api_key_var": "",
@@ -102,6 +102,27 @@ BOTS = {
         "log": Path("strategy5_log.csv"),
         "old_log": Path("strategy5_trades.csv"),
     },
+    "Strategy 6 Forex": {
+        "bot_group": "STRATEGY_6",
+        "strategy": "strategy_6_forex_top_down",
+        "model": "development_not_running",
+        "type": "development",
+        "api_key_var": "",
+        "secret_key_var": "",
+        "paper_var": "",
+        "account_name_var": "",
+        "log": Path("strategy6_forex_log.csv"),
+        "old_log": Path("strategy6_forex_backtests.csv"),
+    },
+}
+
+STRATEGY_META = {
+    "Breakout Momentum": {"number": "Strategy 1", "market": "Stocks", "mode": "Paper", "status": "Testing"},
+    "Pullback Reclaim": {"number": "Strategy 2", "market": "Stocks", "mode": "Paper", "status": "Testing"},
+    "HA 100 EMA Doji": {"number": "Strategy 3", "market": "Stocks", "mode": "Paper", "status": "Testing"},
+    "Alligator Trend": {"number": "Strategy 4", "market": "Stocks", "mode": "Paper", "status": "Testing"},
+    "Strategy 5 VWAP Reclaim Simulator": {"number": "Strategy 5", "market": "Stocks", "mode": "Simulation", "status": "Running"},
+    "Strategy 6 Forex": {"number": "Strategy 6", "market": "Forex", "mode": "Development", "status": "Not Running"},
 }
 
 
@@ -279,8 +300,8 @@ def get_alpaca_client(bot_info: dict | None = None):
     if TradingClient is None:
         return None, "Missing alpaca-py package"
 
-    if not bot_info or bot_info.get("type") == "simulator":
-        return None, "Simulator strategy does not use Alpaca positions"
+    if not bot_info or bot_info.get("type") in ("simulator", "development"):
+        return None, "This strategy is not connected to Alpaca positions"
 
     key = os.getenv(bot_info.get("api_key_var", ""), "")
     secret = os.getenv(bot_info.get("secret_key_var", ""), "")
@@ -330,7 +351,7 @@ def load_unique_open_positions() -> pd.DataFrame:
     seen = set()
 
     for name, info in BOTS.items():
-        if info.get("type") == "simulator":
+        if info.get("type") in ("simulator", "development"):
             continue
 
         account_key = info.get("api_key_var", "")
@@ -1132,7 +1153,7 @@ for name, info in BOTS.items():
 
 closed_trades_df = load_closed_trades()
 realized_df = add_quality_scores(pair_realized_trades(closed_trades_df))
-strategy5_df = bot_data.get("Strategy 5 ORB/VWAP", pd.DataFrame())
+strategy5_df = bot_data.get("Strategy 5 VWAP Reclaim Simulator", pd.DataFrame())
 
 # Build rejected dataframe
 rejected_parts = []
@@ -1189,7 +1210,72 @@ def fetch_strategy5_daily_pnl():
         return None, f"Could not load Strategy 5 daily P/L: {exc}"
 
 
-st.title("Trading Operations Center V9")
+def get_daily_pnl_for_strategy(strategy_name, strategy5_summary):
+    """Return today's P/L where it can be attributed accurately."""
+    info = BOTS.get(strategy_name, {})
+
+    if info.get("type") == "development":
+        return None, "Development / no trades"
+
+    if info.get("type") == "simulator":
+        if strategy5_summary:
+            return safe_float(strategy5_summary.get("realized_pnl"), 0.0), "Simulator endpoint"
+        return None, "P/L unavailable"
+
+    if realized_df.empty or "realized_pnl" not in realized_df.columns:
+        return None, "No closed trades"
+
+    temp = realized_df.copy()
+    temp["exit_time"] = pd.to_datetime(temp["exit_time"], errors="coerce", utc=True)
+    temp = temp.dropna(subset=["exit_time"])
+    if temp.empty:
+        return None, "No closed trades"
+
+    today_central = pd.Timestamp.now(tz="America/Chicago").date()
+    temp["_local_date"] = temp["exit_time"].dt.tz_convert("America/Chicago").dt.date
+    temp = temp[temp["_local_date"] == today_central]
+    if temp.empty:
+        return 0.0, "No closed trades today"
+
+    strategy_id = str(info.get("strategy", "")).lower()
+    model_id = str(info.get("model", "")).lower()
+    bot_group = str(info.get("bot_group", "")).lower()
+
+    exact_mask = pd.Series(False, index=temp.index)
+    if "strategy" in temp.columns and strategy_id:
+        exact_mask |= temp["strategy"].astype(str).str.lower().eq(strategy_id)
+    if "model" in temp.columns and model_id:
+        exact_mask |= temp["model"].astype(str).str.lower().eq(model_id)
+    if "bot_group" in temp.columns and bot_group:
+        exact_mask |= temp["bot_group"].astype(str).str.lower().eq(bot_group)
+
+    exact_rows = temp[exact_mask]
+    if not exact_rows.empty:
+        pnl = pd.to_numeric(exact_rows["realized_pnl"], errors="coerce").fillna(0).sum()
+        return float(pnl), "Strategy-tagged fills"
+
+    account_var = info.get("api_key_var", "")
+    account_strategies = [
+        bot_name for bot_name, bot in BOTS.items()
+        if bot.get("type") not in ("simulator", "development")
+        and bot.get("api_key_var", "") == account_var
+    ]
+    account_name = os.getenv(info.get("account_name_var", ""), "").strip()
+
+    if len(account_strategies) == 1 and account_name and "source_env" in temp.columns:
+        account_rows = temp[temp["source_env"].astype(str) == account_name]
+        if not account_rows.empty:
+            pnl = pd.to_numeric(account_rows["realized_pnl"], errors="coerce").fillna(0).sum()
+            return float(pnl), "Dedicated Alpaca account"
+
+    return None, "Needs strategy-tagged exits"
+
+
+def format_daily_pnl(value):
+    return "Pending" if value is None else f"${value:,.2f}"
+
+
+st.title("Coach T Trading Command Center")
 st.caption(f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 st.info(f"Dashboard is filtering all report data from {DATA_START_DATE_LABEL} forward.")
 
@@ -1223,17 +1309,68 @@ tabs = st.tabs([
     "Bot Health",
     "Daily Reports",
     "Raw Logs",
+    "Strategy 6 Forex",
 ])
 
 
 with tabs[0]:
-    st.header("Command Center")
+    st.header("Coach T Command Center")
+    st.caption("One dashboard for all six strategies: paper trading, simulation, and strategies still in development.")
 
     strategy5_summary, strategy5_error = fetch_strategy5_daily_pnl()
 
-    if strategy5_summary:
-        st.subheader("Strategy 5 Today")
+    st.subheader("Daily P/L by Strategy")
+    status_rows = []
+    for name, info in BOTS.items():
+        df = bot_data.get(name, pd.DataFrame())
+        today_df = get_today_rows(df)
+        meta = STRATEGY_META.get(name, {})
+        daily_pnl, pnl_source = get_daily_pnl_for_strategy(name, strategy5_summary)
+        status_rows.append({
+            "Strategy": meta.get("number", name),
+            "System": name,
+            "Market": meta.get("market", ""),
+            "Mode": meta.get("mode", ""),
+            "Status": meta.get("status", ""),
+            "Daily P/L": format_daily_pnl(daily_pnl),
+            "P/L Source": pnl_source,
+            "Rows Today": len(today_df),
+            "Total Rows": len(df),
+            "Last Event": get_last_event(df),
+        })
 
+    status_df = pd.DataFrame(status_rows)
+
+    for row_group in [status_rows[:3], status_rows[3:]]:
+        cols = st.columns(3)
+        for col, row in zip(cols, row_group):
+            with col:
+                st.markdown(f"**{row['Strategy']} — {row['System']}**")
+                st.caption(f"{row['Market']} | {row['Mode']}")
+                st.metric("Daily P/L", row["Daily P/L"])
+                st.caption(f"P/L source: {row['P/L Source']}")
+                if row["Status"] == "Running":
+                    st.success(row["Status"])
+                elif row["Status"] == "Not Running":
+                    st.info(row["Status"])
+                else:
+                    st.warning(row["Status"])
+                st.caption(f"Rows loaded: {row['Total Rows']} | Last event: {row['Last Event']}")
+
+    st.info(
+        "Strategy 5 P/L comes from its simulator endpoint. A paper strategy may show Pending until "
+        "its closed orders carry strategy tags. Strategies sharing one Alpaca account cannot be split accurately from account history alone."
+    )
+
+    st.divider()
+
+    st.subheader("Strategy 5 — Simulation Monitor")
+    st.warning(
+        "May 22 Strategy 5 results are a disrupted test session. "
+        "The monitor could not pull prices earlier in the day, and the after-hours MSFT manual test should not be used for performance scoring."
+    )
+
+    if strategy5_summary:
         s5_c1, s5_c2, s5_c3, s5_c4 = st.columns(4)
 
         realized_pnl = float(strategy5_summary.get("realized_pnl") or 0)
@@ -1242,44 +1379,32 @@ with tabs[0]:
         open_trades = int(strategy5_summary.get("open_trades") or 0)
         open_symbols = strategy5_summary.get("open_symbols") or []
 
-        s5_c1.metric("S5 Daily P/L", f"${realized_pnl:,.2f}")
+        s5_c1.metric("S5 Reported Daily P/L", f"${realized_pnl:,.2f}")
         s5_c2.metric("S5 Closed Trades", closed_trades)
-        s5_c3.metric("S5 Win Rate", f"{win_rate:.1f}%")
+        s5_c3.metric("S5 Reported Win Rate", f"{win_rate:.1f}%")
         s5_c4.metric("S5 Open Trades", open_trades)
 
         if open_symbols:
             st.caption("S5 Open Symbols: " + ", ".join(open_symbols))
-
     else:
         st.warning(f"Strategy 5 daily P/L unavailable: {strategy5_error}")
 
     st.divider()
-
-    rows = []
-    for name, df in bot_data.items():
-        today_df = get_today_rows(df)
-        rows.append({
-            "Strategy": name,
-            "Rows Today": len(today_df),
-            "Total Rows": len(df),
-            "Accepted": count_status(df, "ACCEPTED"),
-            "Rejected": count_status(df, "REJECTED"),
-            "Orders Submitted": count_status(df, "ORDER_SUBMITTED"),
-            "Simulated": count_status(df, "SIMULATED"),
-            "Last Event": get_last_event(df),
-        })
-
-    summary_df = pd.DataFrame(rows)
+    st.subheader("System Totals")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Strategies", len(BOTS))
+    c1.metric("Strategies Tracked", len(BOTS))
     c2.metric("Closed Orders", len(closed_trades_df))
     c3.metric("Realized P/L Rows", len(realized_df))
     c4.metric("Rejected Signals", len(rejected_df))
     c5.metric("Strategy 5 Rows", len(strategy5_df))
 
-    st.dataframe(summary_df, use_container_width=True)
+    st.dataframe(status_df, use_container_width=True)
 
+    st.info(
+        "Strategy 6 Forex is now included in Coach T as Development / Not Running. "
+        "Its panel is ready for TradingView backtest files and future signal testing."
+    )
 
 with tabs[1]:
     st.header("Unified Open Positions")
@@ -1340,8 +1465,8 @@ with tabs[3]:
 
 
 with tabs[4]:
-    st.header("Strategy 5 ORB/VWAP Simulator")
-    st.caption("Strategy 5 is a TradingView-driven simulator. It should eventually write to Railway Postgres trade_events.")
+    st.header("Strategy 5 VWAP Reclaim Simulator")
+    st.caption("Strategy 5 is a TradingView-driven simulator writing trade activity through Railway/Postgres.")
 
     if strategy5_df.empty:
         st.warning("No Strategy 5 rows found yet.")
@@ -1629,6 +1754,23 @@ with tabs[16]:
     health_rows = []
 
     for name, info in BOTS.items():
+        if info.get("type") == "development":
+            health_rows.append({
+                "Strategy": name,
+                "Bot Group": info.get("bot_group", ""),
+                "API Connected": "N/A",
+                "Positions Connected": "N/A",
+                "Open Positions": 0,
+                "Account Status": "Development / Not Running",
+                "Equity": 0.0,
+                "Cash": 0.0,
+                "Buying Power": 0.0,
+                "Last Log Event": get_last_event(bot_data.get(name, pd.DataFrame())),
+                "Rows Loaded": len(bot_data.get(name, pd.DataFrame())),
+                "Bot Type": info.get("type", ""),
+            })
+            continue
+
         if info.get("type") == "simulator":
             strategy5_rows = len(strategy5_df)
             health_rows.append({
@@ -1693,7 +1835,8 @@ with tabs[16]:
     st.subheader("Health Notes")
     st.write("- API Connected means Railway can authenticate to that Alpaca paper account.")
     st.write("- Positions Connected means Railway can pull open positions from that account.")
-    st.write("- Strategy 5 is a simulator and should be loaded from shared Postgres trade_events.")
+    st.write("- Strategy 5 is a simulator loaded from shared Postgres trade_events.")
+    st.write("- Strategy 6 Forex is intentionally listed as Development / Not Running until testing is stable.")
 
 
 with tabs[17]:
@@ -1780,3 +1923,35 @@ with tabs[18]:
         st.dataframe(selected_df.tail(300), use_container_width=True)
         st.write("Columns found:")
         st.code(", ".join(selected_df.columns.astype(str)))
+
+
+
+with tabs[19]:
+    st.header("Strategy 6 — Forex Development")
+    st.info("Status: Development / Not Running. No live or simulated trading is enabled for Strategy 6 yet.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Market", "Forex")
+    c2.metric("Testing Pair", "EURUSD")
+    c3.metric("Current Mode", "Development")
+    c4.metric("Live Signals", "Disabled")
+
+    st.subheader("Current Strategy Concept")
+    st.write(
+        "Top-down market structure review using higher timeframes, "
+        "with an engulfing-candle entry concept on the lower timeframe."
+    )
+
+    st.subheader("Development Checklist")
+    st.checkbox("Confirm final multi-timeframe entry rules", value=False, disabled=True)
+    st.checkbox("Produce acceptable TradingView backtest results", value=False, disabled=True)
+    st.checkbox("Choose risk and session limits", value=False, disabled=True)
+    st.checkbox("Connect alerts to a simulator only", value=False, disabled=True)
+    st.checkbox("Approve for paper testing", value=False, disabled=True)
+
+    strategy6_df = bot_data.get("Strategy 6 Forex", pd.DataFrame())
+    if strategy6_df.empty:
+        st.caption("No Strategy 6 data loaded yet. This is expected while the Forex strategy is under development.")
+    else:
+        st.subheader("Loaded Strategy 6 Data")
+        st.dataframe(strategy6_df.head(500), use_container_width=True)
