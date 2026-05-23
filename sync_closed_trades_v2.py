@@ -23,6 +23,30 @@ def safe_value(value):
     return str(value)
 
 
+def strategy_from_client_order_id(client_order_id):
+    """
+    Decode Coach T client order tags added by the auto-scanner bot.
+    Older orders without these tags remain unattributed.
+    """
+    value = safe_value(client_order_id).lower()
+
+    if value.startswith("ct_s1_breakout_"):
+        return {
+            "bot_group": "DIRECT_SCANNER",
+            "strategy": "breakout_momentum_v1",
+            "model": "direct_breakout_live_v1",
+        }
+
+    if value.startswith("ct_s2_pullback_"):
+        return {
+            "bot_group": "DIRECT_SCANNER",
+            "strategy": "pullback_reclaim_v1",
+            "model": "direct_pullback_live_v1",
+        }
+
+    return {"bot_group": "", "strategy": "", "model": ""}
+
+
 def env_bool(name, default=True):
     value = os.getenv(name)
     if value is None:
@@ -72,6 +96,10 @@ def write_rows(rows):
     fieldnames = [
         "synced_at",
         "source_env",
+        "bot_group",
+        "strategy",
+        "model",
+        "parent_order_id",
         "symbol",
         "side",
         "qty",
@@ -114,6 +142,7 @@ def sync_closed_trades():
         status=QueryOrderStatus.CLOSED,
         limit=500,
         direction="desc",
+        nested=True,
     )
 
     for item in clients:
@@ -127,30 +156,47 @@ def sync_closed_trades():
             continue
 
         for order in orders:
-            order_id = str(order.id)
+            parent_order_id = safe_value(getattr(order, "id", ""))
+            parent_tag = strategy_from_client_order_id(getattr(order, "client_order_id", ""))
 
-            if order_id in seen_ids:
-                continue
+            related_orders = [(order, "")]
+            for leg in (getattr(order, "legs", None) or []):
+                related_orders.append((leg, parent_order_id))
 
-            seen_ids.add(order_id)
+            for related_order, related_parent_id in related_orders:
+                order_id = safe_value(getattr(related_order, "id", ""))
 
-            rows.append({
-                "synced_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "source_env": source,
-                "symbol": safe_value(order.symbol),
-                "side": safe_value(order.side).replace("OrderSide.", "").lower(),
-                "qty": safe_value(order.qty),
-                "filled_qty": safe_value(order.filled_qty),
-                "filled_avg_price": safe_value(order.filled_avg_price),
-                "filled_at": safe_value(order.filled_at),
-                "submitted_at": safe_value(order.submitted_at),
-                "status": safe_value(order.status).replace("OrderStatus.", "").lower(),
-                "order_type": safe_value(order.type).replace("OrderType.", "").lower(),
-                "order_class": safe_value(order.order_class).replace("OrderClass.", "").lower(),
-                "time_in_force": safe_value(order.time_in_force).replace("TimeInForce.", "").lower(),
-                "order_id": order_id,
-                "client_order_id": safe_value(order.client_order_id),
-            })
+                if not order_id or order_id in seen_ids:
+                    continue
+
+                seen_ids.add(order_id)
+
+                own_tag = strategy_from_client_order_id(
+                    getattr(related_order, "client_order_id", "")
+                )
+                strategy_tag = own_tag if own_tag.get("strategy") else parent_tag
+
+                rows.append({
+                    "synced_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "source_env": source,
+                    "bot_group": strategy_tag.get("bot_group", ""),
+                    "strategy": strategy_tag.get("strategy", ""),
+                    "model": strategy_tag.get("model", ""),
+                    "parent_order_id": related_parent_id,
+                    "symbol": safe_value(getattr(related_order, "symbol", "")),
+                    "side": safe_value(getattr(related_order, "side", "")).replace("OrderSide.", "").lower(),
+                    "qty": safe_value(getattr(related_order, "qty", "")),
+                    "filled_qty": safe_value(getattr(related_order, "filled_qty", "")),
+                    "filled_avg_price": safe_value(getattr(related_order, "filled_avg_price", "")),
+                    "filled_at": safe_value(getattr(related_order, "filled_at", "")),
+                    "submitted_at": safe_value(getattr(related_order, "submitted_at", "")),
+                    "status": safe_value(getattr(related_order, "status", "")).replace("OrderStatus.", "").lower(),
+                    "order_type": safe_value(getattr(related_order, "type", "")).replace("OrderType.", "").lower(),
+                    "order_class": safe_value(getattr(related_order, "order_class", "")).replace("OrderClass.", "").lower(),
+                    "time_in_force": safe_value(getattr(related_order, "time_in_force", "")).replace("TimeInForce.", "").lower(),
+                    "order_id": order_id,
+                    "client_order_id": safe_value(getattr(related_order, "client_order_id", "")),
+                })
 
     write_rows(rows)
 
