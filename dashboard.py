@@ -45,6 +45,15 @@ STRATEGY5_DAILY_PNL_URL = os.getenv(
 # reads its public, simulation-only status/results endpoints rather than assuming
 # Strategy 6 records exist in this dashboard service's DATABASE_URL.
 STRATEGY6_MONITOR_BASE_URL = os.getenv("STRATEGY6_MONITOR_BASE_URL", "").strip().rstrip("/")
+STRATEGY3_SERVICE_BASE_URL = os.getenv("STRATEGY3_SERVICE_BASE_URL", "").strip().rstrip("/")
+STRATEGY4_SERVICE_BASE_URL = os.getenv("STRATEGY4_SERVICE_BASE_URL", "").strip().rstrip("/")
+
+BOT_EVENT_SERVICE_NAMES = {
+    "Breakout Momentum": "Alpaca Direct Bot - Auto Scanner",
+    "Pullback Reclaim": "Alpaca Direct Bot - Auto Scanner",
+    "HA 100 EMA Doji": "TradingView Bot - QQQ TSLA AMD",
+    "Alligator Trend": "Alligator Bot - LIVE",
+}
 
 BOTS = {
     "Breakout Momentum": {
@@ -611,6 +620,27 @@ def get_database_engine():
         return create_engine(database_url, pool_pre_ping=True), ""
     except Exception as e:
         return None, str(e)
+
+
+def load_bot_events_from_postgres(strategy_name: str) -> pd.DataFrame:
+    """Loads runtime/event records written by Strategies 1-4 into shared Postgres."""
+    engine, err = get_database_engine()
+    service_name = BOT_EVENT_SERVICE_NAMES.get(strategy_name)
+    if engine is None or not service_name:
+        return pd.DataFrame()
+
+    try:
+        query = text("""
+            SELECT *
+            FROM bot_events
+            WHERE bot_name = :bot_name
+            ORDER BY id DESC
+            LIMIT 1000
+        """)
+        df = pd.read_sql(query, engine, params={"bot_name": service_name})
+        return filter_from_start_date(df)
+    except Exception:
+        return pd.DataFrame()
 
 
 def load_strategy5_events_from_postgres() -> pd.DataFrame:
@@ -1262,6 +1292,34 @@ def _fetch_json_endpoint(url, label):
         return None, f"Could not load {label}: {exc}"
 
 
+def fetch_webhook_service_health(base_url: str, label: str):
+    if not base_url:
+        return None, f"Set {label} URL variable to show service health."
+    return _fetch_json_endpoint(f"{base_url}/health", f"{label} health endpoint")
+
+
+def webhook_runtime_state(payload, error, df):
+    if error:
+        return "Needs Service URL", error
+    if not payload or str(payload.get("status", "")).lower() != "online":
+        return "Service Status Unknown", "The service did not report online status."
+    if df is not None and not df.empty:
+        latest = str(df.iloc[0].get("event_type", "")).upper()
+        if latest == "ERROR":
+            return "Running — Last Event Error", "Service is online; review the last error row."
+        return "Running — Waiting for Alert", "Service is online and event reporting is connected."
+    return "Running — Waiting for Alert", "Service is online; connect shared DATABASE_URL to display event rows."
+
+
+def scanner_runtime_state(df):
+    if df is None or df.empty:
+        return "Needs Database Connection", "Connect alpaca-direct-bot DATABASE_URL to Coach Q Trading Database."
+    latest = str(df.iloc[0].get("event_type", "")).upper()
+    if latest == "ERROR":
+        return "Monitor Error", "Auto Scanner reported an error in its latest database event."
+    return "Running — Scanner Reporting", "Auto Scanner is writing shared health/activity events for both scanner strategies."
+
+
 def fetch_strategy6_monitor_status():
     if not STRATEGY6_MONITOR_BASE_URL:
         return None, "Set STRATEGY6_MONITOR_BASE_URL to the public Python OANDA Monitor service URL."
@@ -1367,10 +1425,18 @@ strategy6_status_label, strategy6_status_detail = strategy6_runtime_state(
 )
 STRATEGY_META["Strategy 6 Forex"]["status"] = strategy6_status_label
 
+strategy3_health, strategy3_health_error = fetch_webhook_service_health(STRATEGY3_SERVICE_BASE_URL, "STRATEGY3_SERVICE_BASE_URL")
+strategy4_health, strategy4_health_error = fetch_webhook_service_health(STRATEGY4_SERVICE_BASE_URL, "STRATEGY4_SERVICE_BASE_URL")
+runtime_details = {"Strategy 6 Forex": strategy6_status_detail}
+
 bot_data = {}
 for name, info in BOTS.items():
     if name == "Strategy 6 Forex" and not strategy6_endpoint_forward_df.empty:
         df = strategy6_endpoint_forward_df.copy()
+    elif name in BOT_EVENT_SERVICE_NAMES:
+        df = load_bot_events_from_postgres(name)
+        if df.empty:
+            df = load_log(info["log"])
     else:
         df = load_log(info["log"])
     if df.empty and "old_log" in info:
@@ -1384,6 +1450,19 @@ for name, info in BOTS.items():
     df = filter_from_start_date(df)
 
     bot_data[name] = df
+
+for scanner_name in ["Breakout Momentum", "Pullback Reclaim"]:
+    label, detail = scanner_runtime_state(bot_data.get(scanner_name, pd.DataFrame()))
+    STRATEGY_META[scanner_name]["status"] = label
+    runtime_details[scanner_name] = detail
+
+label, detail = webhook_runtime_state(strategy3_health, strategy3_health_error, bot_data.get("HA 100 EMA Doji", pd.DataFrame()))
+STRATEGY_META["HA 100 EMA Doji"]["status"] = label
+runtime_details["HA 100 EMA Doji"] = detail
+
+label, detail = webhook_runtime_state(strategy4_health, strategy4_health_error, bot_data.get("Alligator Trend", pd.DataFrame()))
+STRATEGY_META["Alligator Trend"]["status"] = label
+runtime_details["Alligator Trend"] = detail
 
 closed_trades_df = load_closed_trades()
 realized_df = add_quality_scores(pair_realized_trades(closed_trades_df))
@@ -1619,10 +1698,13 @@ with tabs[0]:
                     st.caption(f"Simulated trade rows: {row['Total Rows']} | {strategy6_status_detail}")
                 else:
                     st.caption(f"Rows loaded: {row['Total Rows']} | Last event: {row['Last Event']}")
+                    if row["System"] in runtime_details:
+                        st.caption(runtime_details[row["System"]])
 
     st.info(
-        "Strategy 5 P/L comes from its simulator endpoint. A paper strategy may show Pending until "
-        "its closed orders carry strategy tags. Strategies sharing one Alpaca account cannot be split accurately from account history alone."
+        "Strategies 1-4 load health/activity from the shared Coach Q Trading Database; Strategies 3 and 4 also verify their webhook service URLs. "
+        "Strategy 5 uses its simulator endpoint. Strategy 6 uses its separate Python OANDA monitor endpoint. "
+        "Paper P/L can remain Pending until closed orders carry strategy tags."
     )
 
     st.divider()
