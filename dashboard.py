@@ -1250,97 +1250,6 @@ def build_v9_recap(realized_df: pd.DataFrame, rejected_df: pd.DataFrame) -> str:
     return base + symbol_text + time_text + rej_text + next_steps
 
 
-# Load Data
-
-
-auto_sync_once_on_open()
-
-strategy6_monitor_status, strategy6_monitor_error = fetch_strategy6_monitor_status()
-strategy6_endpoint_forward_df, strategy6_forward_endpoint_error = fetch_strategy6_forward_results()
-strategy6_status_label, strategy6_status_detail = strategy6_runtime_state(
-    strategy6_monitor_status,
-    strategy6_monitor_error,
-    strategy6_endpoint_forward_df,
-)
-STRATEGY_META["Strategy 6 Forex"]["status"] = strategy6_status_label
-
-bot_data = {}
-for name, info in BOTS.items():
-    if name == "Strategy 6 Forex" and not strategy6_endpoint_forward_df.empty:
-        df = strategy6_endpoint_forward_df.copy()
-    else:
-        df = load_log(info["log"])
-    if df.empty and "old_log" in info:
-        df = load_log(info["old_log"])
-        if info.get("bot_group") == "DIRECT_SCANNER":
-            df = normalize_old_scanner_log(df, name)
-
-    if info.get("type") == "simulator" and df.empty:
-        df = load_strategy5_events()
-
-    df = filter_from_start_date(df)
-
-    bot_data[name] = df
-
-closed_trades_df = load_closed_trades()
-realized_df = add_quality_scores(pair_realized_trades(closed_trades_df))
-strategy5_df = bot_data.get("Strategy 5 VWAP Reclaim Simulator", pd.DataFrame())
-
-# Build rejected dataframe
-rejected_parts = []
-for name, df in bot_data.items():
-    if df.empty:
-        continue
-
-    temp = df.copy()
-    temp["Strategy Name"] = name
-
-    if "status" in temp.columns:
-        temp = temp[temp["status"].astype(str).str.upper() == "REJECTED"]
-    elif "decision" in temp.columns:
-        temp = temp[temp["decision"].astype(str).str.upper() == "REJECTED"]
-    else:
-        temp = pd.DataFrame()
-
-    if not temp.empty:
-        rejected_parts.append(temp)
-
-rejected_df = pd.concat(rejected_parts, ignore_index=True, sort=False) if rejected_parts else pd.DataFrame()
-
-
-# Sidebar / Header
-
-
-st.sidebar.title("Ops Controls")
-st.sidebar.caption("Railway dashboard syncs automatically on open and when Refresh Dashboard is clicked.")
-
-if "last_sync_time" in st.session_state:
-    if st.session_state.get("last_sync_ok"):
-        st.sidebar.success(f"Last sync: {st.session_state['last_sync_time']}")
-    else:
-        st.sidebar.error(f"Last sync failed: {st.session_state['last_sync_time']}")
-
-    with st.sidebar.expander("Last sync message"):
-        st.code(st.session_state.get("last_sync_msg", ""))
-
-def fetch_strategy5_daily_pnl():
-    try:
-        with urllib.request.urlopen(STRATEGY5_DAILY_PNL_URL, timeout=8) as response:
-            raw = response.read().decode("utf-8")
-            data = json.loads(raw)
-
-        if not data.get("ok"):
-            return None, data.get("error", "Strategy 5 daily P/L endpoint returned ok=false")
-
-        return data.get("summary", {}), None
-
-    except urllib.error.URLError as exc:
-        return None, f"Could not reach Strategy 5 daily P/L endpoint: {exc}"
-
-    except Exception as exc:
-        return None, f"Could not load Strategy 5 daily P/L: {exc}"
-
-
 def _fetch_json_endpoint(url, label):
     if not url:
         return None, f"{label} URL not configured"
@@ -1441,6 +1350,98 @@ def strategy6_cycle_caption(status_payload):
     pairs = summary.get("pairs_checked", len(cycle.get("results") or []))
     errors = summary.get("pairs_error", sum(1 for item in cycle.get("results", []) if item.get("error")))
     return f"Last scan: {stamp} | Pairs checked: {pairs} | Errors: {errors}"
+
+
+
+# Load Data
+
+
+auto_sync_once_on_open()
+
+strategy6_monitor_status, strategy6_monitor_error = fetch_strategy6_monitor_status()
+strategy6_endpoint_forward_df, strategy6_forward_endpoint_error = fetch_strategy6_forward_results()
+strategy6_status_label, strategy6_status_detail = strategy6_runtime_state(
+    strategy6_monitor_status,
+    strategy6_monitor_error,
+    strategy6_endpoint_forward_df,
+)
+STRATEGY_META["Strategy 6 Forex"]["status"] = strategy6_status_label
+
+bot_data = {}
+for name, info in BOTS.items():
+    if name == "Strategy 6 Forex" and not strategy6_endpoint_forward_df.empty:
+        df = strategy6_endpoint_forward_df.copy()
+    else:
+        df = load_log(info["log"])
+    if df.empty and "old_log" in info:
+        df = load_log(info["old_log"])
+        if info.get("bot_group") == "DIRECT_SCANNER":
+            df = normalize_old_scanner_log(df, name)
+
+    if info.get("type") == "simulator" and df.empty:
+        df = load_strategy5_events()
+
+    df = filter_from_start_date(df)
+
+    bot_data[name] = df
+
+closed_trades_df = load_closed_trades()
+realized_df = add_quality_scores(pair_realized_trades(closed_trades_df))
+strategy5_df = bot_data.get("Strategy 5 VWAP Reclaim Simulator", pd.DataFrame())
+
+# Build rejected dataframe
+rejected_parts = []
+for name, df in bot_data.items():
+    if df.empty:
+        continue
+
+    temp = df.copy()
+    temp["Strategy Name"] = name
+
+    if "status" in temp.columns:
+        temp = temp[temp["status"].astype(str).str.upper() == "REJECTED"]
+    elif "decision" in temp.columns:
+        temp = temp[temp["decision"].astype(str).str.upper() == "REJECTED"]
+    else:
+        temp = pd.DataFrame()
+
+    if not temp.empty:
+        rejected_parts.append(temp)
+
+rejected_df = pd.concat(rejected_parts, ignore_index=True, sort=False) if rejected_parts else pd.DataFrame()
+
+
+# Sidebar / Header
+
+
+st.sidebar.title("Ops Controls")
+st.sidebar.caption("Railway dashboard syncs automatically on open and when Refresh Dashboard is clicked.")
+
+if "last_sync_time" in st.session_state:
+    if st.session_state.get("last_sync_ok"):
+        st.sidebar.success(f"Last sync: {st.session_state['last_sync_time']}")
+    else:
+        st.sidebar.error(f"Last sync failed: {st.session_state['last_sync_time']}")
+
+    with st.sidebar.expander("Last sync message"):
+        st.code(st.session_state.get("last_sync_msg", ""))
+
+def fetch_strategy5_daily_pnl():
+    try:
+        with urllib.request.urlopen(STRATEGY5_DAILY_PNL_URL, timeout=8) as response:
+            raw = response.read().decode("utf-8")
+            data = json.loads(raw)
+
+        if not data.get("ok"):
+            return None, data.get("error", "Strategy 5 daily P/L endpoint returned ok=false")
+
+        return data.get("summary", {}), None
+
+    except urllib.error.URLError as exc:
+        return None, f"Could not reach Strategy 5 daily P/L endpoint: {exc}"
+
+    except Exception as exc:
+        return None, f"Could not load Strategy 5 daily P/L: {exc}"
 
 
 def get_daily_pnl_for_strategy(strategy_name, strategy5_summary, strategy6_forward_df=None):
@@ -2074,7 +2075,7 @@ with tabs[16]:
             "Strategy": name,
             "Bot Group": info.get("bot_group", ""),
             "_Account Key": info.get("api_key_var", ""),
-            "API Connected": api_ok,
+            "API Connected": "Yes" if api_ok else "No",
             "Positions Connected": positions_ok,
             "Open Positions": len(positions),
             "Account Status": account_status,
@@ -2090,7 +2091,7 @@ with tabs[16]:
 
     connected_accounts_df = pd.DataFrame()
     if not health_df.empty:
-        connected_accounts_df = health_df[health_df["API Connected"] == True].copy()
+        connected_accounts_df = health_df[health_df["API Connected"] == "Yes"].copy()
         connected_accounts_df = connected_accounts_df.drop_duplicates(subset=["_Account Key"])
 
     unique_accounts_connected = len(connected_accounts_df)
