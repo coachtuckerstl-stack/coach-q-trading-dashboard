@@ -41,6 +41,11 @@ STRATEGY5_DAILY_PNL_URL = os.getenv(
     "https://web-production-ab0c0.up.railway.app/daily-pnl",
 )
 
+# Strategy 6 runs in a separate Railway project/Postgres database. The dashboard
+# reads its public, simulation-only status/results endpoints rather than assuming
+# Strategy 6 records exist in this dashboard service's DATABASE_URL.
+STRATEGY6_MONITOR_BASE_URL = os.getenv("STRATEGY6_MONITOR_BASE_URL", "").strip().rstrip("/")
+
 BOTS = {
     "Breakout Momentum": {
         "bot_group": "DIRECT_SCANNER",
@@ -122,7 +127,7 @@ STRATEGY_META = {
     "HA 100 EMA Doji": {"number": "Strategy 3", "market": "Stocks", "mode": "Paper", "status": "Testing"},
     "Alligator Trend": {"number": "Strategy 4", "market": "Stocks", "mode": "Paper", "status": "Testing"},
     "Strategy 5 VWAP Reclaim Simulator": {"number": "Strategy 5", "market": "Stocks", "mode": "Simulation", "status": "Running"},
-    "Strategy 6 Forex": {"number": "Strategy 6", "market": "Forex Portfolio", "mode": "Forward Validation", "status": "Candidate"},
+    "Strategy 6 Forex": {"number": "Strategy 6", "market": "Forex Portfolio", "mode": "Forward Validation", "status": "Status Not Connected"},
 }
 
 
@@ -1250,9 +1255,21 @@ def build_v9_recap(realized_df: pd.DataFrame, rejected_df: pd.DataFrame) -> str:
 
 auto_sync_once_on_open()
 
+strategy6_monitor_status, strategy6_monitor_error = fetch_strategy6_monitor_status()
+strategy6_endpoint_forward_df, strategy6_forward_endpoint_error = fetch_strategy6_forward_results()
+strategy6_status_label, strategy6_status_detail = strategy6_runtime_state(
+    strategy6_monitor_status,
+    strategy6_monitor_error,
+    strategy6_endpoint_forward_df,
+)
+STRATEGY_META["Strategy 6 Forex"]["status"] = strategy6_status_label
+
 bot_data = {}
 for name, info in BOTS.items():
-    df = load_log(info["log"])
+    if name == "Strategy 6 Forex" and not strategy6_endpoint_forward_df.empty:
+        df = strategy6_endpoint_forward_df.copy()
+    else:
+        df = load_log(info["log"])
     if df.empty and "old_log" in info:
         df = load_log(info["old_log"])
         if info.get("bot_group") == "DIRECT_SCANNER":
@@ -1324,13 +1341,129 @@ def fetch_strategy5_daily_pnl():
         return None, f"Could not load Strategy 5 daily P/L: {exc}"
 
 
-def get_daily_pnl_for_strategy(strategy_name, strategy5_summary):
+def _fetch_json_endpoint(url, label):
+    if not url:
+        return None, f"{label} URL not configured"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except urllib.error.URLError as exc:
+        return None, f"Could not reach {label}: {exc}"
+    except Exception as exc:
+        return None, f"Could not load {label}: {exc}"
+
+
+def fetch_strategy6_monitor_status():
+    if not STRATEGY6_MONITOR_BASE_URL:
+        return None, "Set STRATEGY6_MONITOR_BASE_URL to the public Python OANDA Monitor service URL."
+    return _fetch_json_endpoint(
+        f"{STRATEGY6_MONITOR_BASE_URL}/monitor/status",
+        "Strategy 6 monitor status endpoint",
+    )
+
+
+def normalize_strategy6_forward_df(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    for col in ["entry_price", "exit_price", "stop_loss", "take_profit"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    parsed_metrics = []
+    for raw in df.get("raw_payload", pd.Series(dtype=str)).fillna(""):
+        try:
+            payload = json.loads(raw)
+            parsed_metrics.append(payload.get("forward_metrics", {}))
+        except Exception:
+            parsed_metrics.append({})
+
+    df["net_r"] = [safe_float(item.get("net_r"), None) for item in parsed_metrics]
+    df["pnl_dollars"] = [safe_float(item.get("pnl_dollars"), None) for item in parsed_metrics]
+    df["risk_pips"] = [safe_float(item.get("risk_pips"), None) for item in parsed_metrics]
+    df["gross_r"] = [safe_float(item.get("gross_r"), None) for item in parsed_metrics]
+    df["cost_pips"] = [safe_float(item.get("cost_pips"), None) for item in parsed_metrics]
+    df["direction"] = df.get("side", "")
+    df["pair"] = df.get("symbol", "")
+    df["entry_time_utc"] = df.get("created_at", "")
+    if "updated_at" in df.columns and "exit_price" in df.columns:
+        df["exit_time_utc"] = df["updated_at"].where(df["exit_price"].notna(), "")
+    else:
+        df["exit_time_utc"] = ""
+    df["stop_price"] = df.get("stop_loss", None)
+    df["target_price"] = df.get("take_profit", None)
+    df["result"] = df.get("status", "")
+    return df
+
+
+def fetch_strategy6_forward_results():
+    if not STRATEGY6_MONITOR_BASE_URL:
+        return pd.DataFrame(), "Set STRATEGY6_MONITOR_BASE_URL to load Strategy 6 results."
+    payload, err = _fetch_json_endpoint(
+        f"{STRATEGY6_MONITOR_BASE_URL}/forward-results",
+        "Strategy 6 forward results endpoint",
+    )
+    if err:
+        return pd.DataFrame(), err
+    trades = payload.get("trades", []) if payload else []
+    return normalize_strategy6_forward_df(pd.DataFrame(trades)), None
+
+
+def strategy6_runtime_state(status_payload, status_error, forward_df):
+    if status_error:
+        return "Status Not Connected", status_error
+    if not status_payload:
+        return "Status Unavailable", "No monitor status response received."
+
+    cycle = status_payload.get("last_monitor_cycle") or {}
+    thread_alive = bool(status_payload.get("thread_alive"))
+    if cycle:
+        summary = cycle.get("summary") or {}
+        if not cycle.get("ok", False):
+            error = summary.get("last_error") or "Latest monitor cycle reported an OANDA/data error."
+            return "Monitor Error", error
+        open_count = int((status_payload.get("forward_summary") or {}).get("open_trades") or 0)
+        if open_count:
+            return "Running — Sim Trade Open", "Monitor is active and managing a simulated open trade."
+        return "Running — Waiting for Signal", "Monitor is active; latest scan completed without an entry."
+    if thread_alive:
+        return "Running — Awaiting First Scan", "Service is online and waiting to record its first scan."
+    return "Monitor Not Running", "Strategy 6 monitor thread is not active."
+
+
+def strategy6_cycle_caption(status_payload):
+    cycle = (status_payload or {}).get("last_monitor_cycle") or {}
+    if not cycle:
+        return "Last scan: none recorded yet"
+    summary = cycle.get("summary") or {}
+    stamp = str(cycle.get("completed_utc") or "unknown")
+    pairs = summary.get("pairs_checked", len(cycle.get("results") or []))
+    errors = summary.get("pairs_error", sum(1 for item in cycle.get("results", []) if item.get("error")))
+    return f"Last scan: {stamp} | Pairs checked: {pairs} | Errors: {errors}"
+
+
+def get_daily_pnl_for_strategy(strategy_name, strategy5_summary, strategy6_forward_df=None):
     """Return today's P/L where it can be attributed accurately."""
     info = BOTS.get(strategy_name, {})
 
+    if strategy_name == "Strategy 6 Forex":
+        df = strategy6_forward_df if strategy6_forward_df is not None else pd.DataFrame()
+        if df.empty or "pnl_dollars" not in df.columns:
+            return 0.0, "Simulation / no closed trades today"
+        closed = df.copy()
+        closed["exit_time_utc"] = pd.to_datetime(closed.get("exit_time_utc"), errors="coerce", utc=True)
+        closed = closed.dropna(subset=["exit_time_utc"])
+        if closed.empty:
+            return 0.0, "Simulation / no closed trades today"
+        today_central = pd.Timestamp.now(tz="America/Chicago").date()
+        today_closed = closed[closed["exit_time_utc"].dt.tz_convert("America/Chicago").dt.date == today_central]
+        if today_closed.empty:
+            return 0.0, "Simulation / no closed trades today"
+        pnl = pd.to_numeric(today_closed["pnl_dollars"], errors="coerce").fillna(0).sum()
+        return float(pnl), "Strategy 6 simulation endpoint"
+
     if info.get("type") == "development":
-        if strategy_name == "Strategy 6 Forex":
-            return None, "Forward validation / live disabled"
         return None, "Development / no trades"
 
     if info.get("type") == "simulator":
@@ -1450,7 +1583,7 @@ with tabs[0]:
         df = bot_data.get(name, pd.DataFrame())
         today_df = get_today_rows(df)
         meta = STRATEGY_META.get(name, {})
-        daily_pnl, pnl_source = get_daily_pnl_for_strategy(name, strategy5_summary)
+        daily_pnl, pnl_source = get_daily_pnl_for_strategy(name, strategy5_summary, strategy6_endpoint_forward_df)
         status_rows.append({
             "Strategy": meta.get("number", name),
             "System": name,
@@ -1474,13 +1607,17 @@ with tabs[0]:
                 st.caption(f"{row['Market']} | {row['Mode']}")
                 st.metric("Daily P/L", row["Daily P/L"])
                 st.caption(f"P/L source: {row['P/L Source']}")
-                if row["Status"] == "Running":
+                if str(row["Status"]).startswith("Running"):
                     st.success(row["Status"])
-                elif row["Status"] == "Not Running":
+                elif row["Status"] in ("Not Running", "Status Not Connected"):
                     st.info(row["Status"])
                 else:
                     st.warning(row["Status"])
-                st.caption(f"Rows loaded: {row['Total Rows']} | Last event: {row['Last Event']}")
+                if row["System"] == "Strategy 6 Forex":
+                    st.caption(strategy6_cycle_caption(strategy6_monitor_status))
+                    st.caption(f"Simulated trade rows: {row['Total Rows']} | {strategy6_status_detail}")
+                else:
+                    st.caption(f"Rows loaded: {row['Total Rows']} | Last event: {row['Last Event']}")
 
     st.info(
         "Strategy 5 P/L comes from its simulator endpoint. A paper strategy may show Pending until "
@@ -1524,11 +1661,11 @@ with tabs[0]:
     c4.metric("Rejected Signals", len(rejected_df))
     c5.metric("Strategy 5 Rows", len(strategy5_df))
 
-    st.dataframe(status_df, use_container_width=True)
+    st.dataframe(status_df, width="stretch")
 
     st.info(
-        "Strategy 6 Forex Portfolio is now listed as Candidate / Forward Validation. "
-        "Its locked rules are being tracked without live trading or rule changes during validation."
+        "Strategy 6 Forex Portfolio remains a locked forward-validation candidate. "
+        "Its status card now reports the separate Python OANDA monitor service directly; live trading remains disabled."
     )
 
 with tabs[1]:
@@ -1549,7 +1686,7 @@ with tabs[1]:
         c2.metric("Total Market Value", f"${total_market:,.2f}")
         c3.metric("Total Unrealized P/L", f"${total_unrealized:,.2f}")
 
-        st.dataframe(positions_df, use_container_width=True)
+        st.dataframe(positions_df, width="stretch")
 
 
 with tabs[2]:
@@ -1560,7 +1697,7 @@ with tabs[2]:
         st.warning("No closed_trades.csv found yet or no closed order rows were returned.")
     else:
         st.metric("Closed Order Rows", len(closed_trades_df))
-        st.dataframe(closed_trades_df.head(500), use_container_width=True)
+        st.dataframe(closed_trades_df.head(500), width="stretch")
 
 
 with tabs[3]:
@@ -1578,7 +1715,7 @@ with tabs[3]:
         c2.metric("Paired Trades", len(realized_df))
         c3.metric("Win Rate", f"{win_rate}%")
 
-        st.dataframe(realized_df.sort_values("exit_time", ascending=False), use_container_width=True)
+        st.dataframe(realized_df.sort_values("exit_time", ascending=False), width="stretch")
 
         st.download_button(
             label="Download Realized P/L CSV",
@@ -1604,7 +1741,7 @@ with tabs[4]:
         c2.metric("Strategy 5 Rows Today", len(today_strategy5))
         c3.metric("Last Strategy 5 Event", get_last_event(strategy5_df))
 
-        st.dataframe(strategy5_df.head(500), use_container_width=True)
+        st.dataframe(strategy5_df.head(500), width="stretch")
 
         st.download_button(
             label="Download Strategy 5 CSV",
@@ -1638,7 +1775,7 @@ with tabs[5]:
         c4.metric("P/L %", f"{trade['pnl_pct']}%")
 
         st.write("Trade Details")
-        st.dataframe(pd.DataFrame([trade]), use_container_width=True)
+        st.dataframe(pd.DataFrame([trade]), width="stretch")
 
         st.write("Review Notes")
         st.info(trade["notes"])
@@ -1655,7 +1792,7 @@ with tabs[7]:
     st.warning("These are recommendations only. Do not auto-change bot rules without reviewing the data first.")
 
     rec_df = build_ai_recommendations(realized_df, rejected_df)
-    st.dataframe(rec_df, use_container_width=True)
+    st.dataframe(rec_df, width="stretch")
 
     high_priority = rec_df[rec_df["Priority"] == "High"] if "Priority" in rec_df.columns else pd.DataFrame()
 
@@ -1674,7 +1811,7 @@ with tabs[8]:
         st.warning("Not enough weekly trade data yet.")
     else:
         st.subheader("7-Day Strategy Performance")
-        st.dataframe(weekly_df, use_container_width=True)
+        st.dataframe(weekly_df, width="stretch")
         st.bar_chart(weekly_df.set_index("Strategy")["Total P/L"])
 
         best = weekly_df.iloc[0]
@@ -1708,7 +1845,7 @@ with tabs[9]:
     if param_df.empty:
         st.success("No major parameter warnings yet.")
     else:
-        st.dataframe(param_df, use_container_width=True)
+        st.dataframe(param_df, width="stretch")
 
     st.subheader("Do-Not-Trade Watchlist")
     blocked_df = build_do_not_trade(realized_df)
@@ -1716,7 +1853,7 @@ with tabs[9]:
     if blocked_df.empty:
         st.success("No symbols currently flagged.")
     else:
-        st.dataframe(blocked_df, use_container_width=True)
+        st.dataframe(blocked_df, width="stretch")
 
     st.subheader("Tomorrow Game Plan")
     for item in build_tomorrow_plan(realized_df):
@@ -1750,7 +1887,7 @@ with tabs[10]:
 
         by_symbol = by_symbol.sort_values("score", ascending=False)
         st.subheader("Symbol Scoreboard")
-        st.dataframe(by_symbol, use_container_width=True)
+        st.dataframe(by_symbol, width="stretch")
     else:
         st.warning("No realized trades to score yet.")
 
@@ -1758,7 +1895,7 @@ with tabs[10]:
         st.subheader("Trade Quality Grades")
         quality_summary = realized_df["quality_grade"].value_counts().reset_index()
         quality_summary.columns = ["Grade", "Count"]
-        st.dataframe(quality_summary, use_container_width=True)
+        st.dataframe(quality_summary, width="stretch")
 
     st.subheader("Strategy Activity Scoreboard")
 
@@ -1780,7 +1917,7 @@ with tabs[10]:
             "Acceptance %": round((accepted / total) * 100, 2) if total else 0,
         })
 
-    st.dataframe(pd.DataFrame(score_rows).sort_values("Activity Score", ascending=False), use_container_width=True)
+    st.dataframe(pd.DataFrame(score_rows).sort_values("Activity Score", ascending=False), width="stretch")
 
 
 with tabs[11]:
@@ -1799,7 +1936,7 @@ with tabs[11]:
         c2.metric("Worst Symbol", worst["symbol"], f"${worst['total_pnl']:.2f}")
 
         st.subheader("Symbol Scoreboard")
-        st.dataframe(symbol_df, use_container_width=True)
+        st.dataframe(symbol_df, width="stretch")
         st.bar_chart(symbol_df.set_index("symbol")[["total_pnl", "avg_pnl"]])
 
 
@@ -1811,7 +1948,7 @@ with tabs[12]:
     if time_df.empty:
         st.warning("No realized trades available for time-of-day analysis yet.")
     else:
-        st.dataframe(time_df, use_container_width=True)
+        st.dataframe(time_df, width="stretch")
         st.bar_chart(time_df.set_index("time_bucket")[["total_pnl", "avg_pnl"]])
         st.info("Use this to decide whether to block or reduce size during weak time windows.")
 
@@ -1831,14 +1968,14 @@ with tabs[13]:
             st.subheader("Rejection Classes")
             class_summary = temp["rejection_class"].value_counts().reset_index()
             class_summary.columns = ["Rejection Class", "Count"]
-            st.dataframe(class_summary, use_container_width=True)
+            st.dataframe(class_summary, width="stretch")
 
             st.subheader("Detailed Rejections")
-            st.dataframe(temp.tail(300), use_container_width=True)
+            st.dataframe(temp.tail(300), width="stretch")
             st.bar_chart(class_summary.set_index("Rejection Class")["Count"])
         else:
             st.warning("Rejected rows exist, but no reason/message column was found.")
-            st.dataframe(rejected_df, use_container_width=True)
+            st.dataframe(rejected_df, width="stretch")
 
 
 with tabs[14]:
@@ -1850,7 +1987,7 @@ with tabs[14]:
         st.warning("No realized trades available for heatmap yet.")
     else:
         st.info("Green/positive days and red/negative days are shown as values by symbol.")
-        st.dataframe(heat, use_container_width=True)
+        st.dataframe(heat, width="stretch")
         st.line_chart(heat)
 
 
@@ -1866,10 +2003,10 @@ with tabs[15]:
             reason_summary = rejected_df[reason_col].astype(str).value_counts().reset_index()
             reason_summary.columns = ["Reason", "Count"]
             st.subheader("Reason Summary")
-            st.dataframe(reason_summary, use_container_width=True)
+            st.dataframe(reason_summary, width="stretch")
 
         st.subheader("Rejected Details")
-        st.dataframe(rejected_df.tail(300), use_container_width=True)
+        st.dataframe(rejected_df.tail(300), width="stretch")
 
 
 with tabs[16]:
@@ -1970,7 +2107,7 @@ with tabs[16]:
 
     st.subheader("Account / API Health")
     display_health_df = health_df.drop(columns=["_Account Key"], errors="ignore")
-    st.dataframe(display_health_df, use_container_width=True)
+    st.dataframe(display_health_df, width="stretch")
 
     st.subheader("Health Notes")
     st.write("- API Connected means Railway can authenticate to that Alpaca paper account.")
@@ -2001,7 +2138,7 @@ with tabs[17]:
     report_df = pd.DataFrame(summary_rows)
 
     st.subheader("Daily Strategy Summary")
-    st.dataframe(report_df, use_container_width=True)
+    st.dataframe(report_df, width="stretch")
 
     st.download_button(
         label="Download Daily Strategy Summary CSV",
@@ -2023,7 +2160,7 @@ with tabs[17]:
         full_df = full_df.sort_values("_dt", ascending=False)
 
         st.subheader("Full Activity Report")
-        st.dataframe(full_df.head(300), use_container_width=True)
+        st.dataframe(full_df.head(300), width="stretch")
 
         st.download_button(
             label="Download Full Daily Activity CSV",
@@ -2061,7 +2198,7 @@ with tabs[18]:
     if selected_df.empty:
         st.warning("No log data found.")
     else:
-        st.dataframe(selected_df.tail(300), use_container_width=True)
+        st.dataframe(selected_df.tail(300), width="stretch")
         st.write("Columns found:")
         st.code(", ".join(selected_df.columns.astype(str)))
 
@@ -2069,16 +2206,23 @@ with tabs[18]:
 
 with tabs[19]:
     st.header("Strategy 6 — Forex Portfolio Forward Validation")
-    st.warning(
-        "Status: Candidate / Forward Validation. Live trading is disabled. "
-        "The strategy rules are locked during the validation sample."
-    )
+    if strategy6_status_label.startswith("Running"):
+        st.success(f"Status: {strategy6_status_label}. Live trading is disabled; the rules remain locked.")
+    elif strategy6_status_label == "Monitor Error":
+        st.error(f"Status: {strategy6_status_label}. {strategy6_status_detail}")
+    else:
+        st.warning(f"Status: {strategy6_status_label}. {strategy6_status_detail}")
 
-    c1, c2, c3, c4 = st.columns(4)
+    cycle = (strategy6_monitor_status or {}).get("last_monitor_cycle") or {}
+    cycle_summary = cycle.get("summary") or {}
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Market", "Forex Portfolio")
     c2.metric("Pairs Tracked", len(STRATEGY6_CANDIDATE["pairs"]))
     c3.metric("Current Mode", "Forward Validation")
-    c4.metric("Live Trading", STRATEGY6_CANDIDATE["live_trading"])
+    c4.metric("Last Scan Pairs", cycle_summary.get("pairs_checked", "—"))
+    c5.metric("Scan Errors", cycle_summary.get("pairs_error", "—"))
+    st.caption(strategy6_cycle_caption(strategy6_monitor_status))
+    st.caption(f"Live Trading: {STRATEGY6_CANDIDATE['live_trading']} | {strategy6_status_detail}")
 
     st.subheader("Locked Candidate")
     st.write(f"**{STRATEGY6_CANDIDATE['name']}**")
@@ -2092,7 +2236,7 @@ with tabs[19]:
         {"Rule": "Target", "Locked Setting": STRATEGY6_CANDIDATE["target"]},
         {"Rule": "Estimated Cost", "Locked Setting": STRATEGY6_CANDIDATE["estimated_cost"]},
     ])
-    st.dataframe(rules_df, use_container_width=True, hide_index=True)
+    st.dataframe(rules_df, width="stretch", hide_index=True)
 
     st.subheader("Known-History Candidate Benchmark")
     st.info(
@@ -2134,12 +2278,18 @@ with tabs[19]:
     db_forward_df = load_strategy6_forward_events_from_postgres()
     forward_df = pd.DataFrame()
 
-    if not db_forward_df.empty:
-        forward_df = db_forward_df
-        st.success("Forward-validation log loaded automatically from shared Railway Postgres.")
+    if not strategy6_endpoint_forward_df.empty:
+        forward_df = strategy6_endpoint_forward_df
+        st.success("Forward-validation log loaded automatically from the Strategy 6 simulation monitor service.")
         st.caption(
-            "This is the live-disabled Strategy 6 validation source of truth. "
+            "This endpoint is the live-disabled Strategy 6 validation source of truth. "
             "Use CSV upload below only for offline/manual review."
+        )
+    elif not db_forward_df.empty:
+        forward_df = db_forward_df
+        st.success("Forward-validation log loaded automatically from dashboard Postgres fallback.")
+        st.caption(
+            "This is a fallback data source. Configure STRATEGY6_MONITOR_BASE_URL to show monitor health and its direct results endpoint."
         )
         if strategy6_upload is not None:
             st.info("A CSV was uploaded, but Postgres data is displayed because live database records take priority.")
@@ -2157,8 +2307,7 @@ with tabs[19]:
     if forward_df.empty:
         st.info(
             "No Strategy 6 forward-validation trades are in Postgres yet. "
-            "After the Strategy 6 Railway webhook service and TradingView alerts are connected, "
-            "new simulated trades will appear here automatically. "
+            "When the Python OANDA monitor produces a simulated entry, it will appear here automatically. "
             f"Keep rules locked until at least {STRATEGY6_CANDIDATE['validation_goal']} new trades are recorded "
             f"(preferred review point: {STRATEGY6_CANDIDATE['preferred_validation_goal']} trades)."
         )
@@ -2207,7 +2356,7 @@ with tabs[19]:
         else:
             st.success("Preferred forward-validation sample size reached. Review performance before any paper-trading decision.")
 
-        st.dataframe(forward_df, use_container_width=True, hide_index=True)
+        st.dataframe(forward_df, width="stretch", hide_index=True)
         st.download_button(
             label="Download Reviewed Strategy 6 Forward Log",
             data=forward_df.to_csv(index=False).encode("utf-8"),
@@ -2225,8 +2374,8 @@ with tabs[19]:
     st.checkbox("Approved for paper execution", value=False, disabled=True)
 
     st.info(
-        "Strategy 6 is designed to read simulated forward-test signals from shared Railway Postgres. "
-        "Once the Strategy 6 webhook service and TradingView alerts are connected, this panel will update automatically. "
+        "Strategy 6 is generated only by its Python OANDA simulation monitor. "
+        "The dashboard reads the monitor service endpoint when STRATEGY6_MONITOR_BASE_URL is configured. "
         "Live broker execution remains disabled."
     )
 
