@@ -1407,6 +1407,15 @@ def fetch_strategy6_forward_results():
     return normalize_strategy6_forward_df(pd.DataFrame(trades)), None
 
 
+def fetch_strategy6_diagnostics():
+    if not STRATEGY6_MONITOR_BASE_URL:
+        return None, "Set STRATEGY6_MONITOR_BASE_URL to load Strategy 6 signal diagnostics."
+    return _fetch_json_endpoint(
+        f"{STRATEGY6_MONITOR_BASE_URL}/monitor/diagnostics",
+        "Strategy 6 diagnostics endpoint",
+    )
+
+
 def strategy6_runtime_state(status_payload, status_error, forward_df):
     if status_error:
         return "Status Not Connected", status_error
@@ -1448,6 +1457,7 @@ auto_sync_once_on_open()
 
 strategy6_monitor_status, strategy6_monitor_error = fetch_strategy6_monitor_status()
 strategy6_endpoint_forward_df, strategy6_forward_endpoint_error = fetch_strategy6_forward_results()
+strategy6_diagnostics, strategy6_diagnostics_error = fetch_strategy6_diagnostics()
 strategy6_status_label, strategy6_status_detail = strategy6_runtime_state(
     strategy6_monitor_status,
     strategy6_monitor_error,
@@ -1733,6 +1743,13 @@ with tabs[0]:
                     st.caption(f"Activity events: {row['Total Activity']} | Last event: {row['Last Event']}")
                 elif row["System"] == "Strategy 6 Forex":
                     st.caption(strategy6_cycle_caption(strategy6_monitor_status))
+                    diag_summary = (strategy6_diagnostics or {}).get("summary") or {}
+                    if diag_summary:
+                        st.caption(
+                            f"Today's active-session checks: {diag_summary.get('pair_candle_checks', 0)} | "
+                            f"AOI touches: {diag_summary.get('aoi_touches', 0)} | "
+                            f"Entries: {diag_summary.get('entries_opened', 0)}"
+                        )
                     st.caption(f"Simulated trade rows: {row['Total Activity']} | {strategy6_status_detail}")
                 else:
                     st.caption(f"{row['Activity Type']}: {row['Total Activity']} | Last event: {row['Last Event']}")
@@ -1902,6 +1919,45 @@ with tabs[5]:
     c3.metric("Scan Errors", summary.get("pairs_error", "—"))
     c4.metric("Forward Sim Rows", len(strategy6_forward_df))
     st.caption(strategy6_cycle_caption(strategy6_monitor_status))
+
+    st.subheader("Today's Signal Diagnostics")
+    if strategy6_diagnostics_error:
+        st.info(
+            "Signal diagnostics will appear after the Strategy 6 monitor diagnostics update deploys. "
+            f"Current detail: {strategy6_diagnostics_error}"
+        )
+    else:
+        diagnostic_summary = (strategy6_diagnostics or {}).get("summary") or {}
+        diagnostic_date = (strategy6_diagnostics or {}).get("session_date_central", "Today")
+        if diagnostic_summary.get("incomplete_session_due_to_bootstrap"):
+            st.warning(
+                f"{diagnostic_date} is an incomplete validation day because the monitor was initialized/redeployed "
+                "during the active session. Diagnostics include only completed candles evaluated after startup."
+            )
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("Active Checks", diagnostic_summary.get("pair_candle_checks", 0))
+        d2.metric("Candles Evaluated", diagnostic_summary.get("completed_candles_evaluated", 0))
+        d3.metric("Structure Aligned", diagnostic_summary.get("structure_aligned", 0))
+        d4.metric("AOI Touches", diagnostic_summary.get("aoi_touches", 0))
+        d5.metric("Entries Opened", diagnostic_summary.get("entries_opened", 0))
+
+        reason_rows = (strategy6_diagnostics or {}).get("reason_counts") or []
+        pair_rows = (strategy6_diagnostics or {}).get("pair_latest") or []
+        if not reason_rows and not pair_rows:
+            st.info("No active-session candle evaluations have been recorded for this Central-time day yet.")
+        else:
+            left, right = st.columns([1, 2])
+            with left:
+                st.caption("Why no entry occurred")
+                st.dataframe(pd.DataFrame(reason_rows), width="stretch", hide_index=True)
+            with right:
+                st.caption("Latest evaluation by pair")
+                pair_df = pd.DataFrame(pair_rows)
+                show_cols = [
+                    col for col in ["symbol", "candle_close_utc", "direction_bias", "reason_code", "reason_detail"]
+                    if col in pair_df.columns
+                ]
+                st.dataframe(pair_df[show_cols], width="stretch", hide_index=True)
 
     st.subheader("Locked Candidate Rules")
     rules_df = pd.DataFrame([
