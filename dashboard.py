@@ -30,6 +30,8 @@ st.set_page_config(page_title="Coach T Trading Command Center", layout="wide")
 
 DATA_START_DATE = pd.Timestamp("2026-05-19", tz="UTC")
 DATA_START_DATE_LABEL = "05/19/2026"
+CENTRAL_TZ = "America/Chicago"
+ANALYSIS_MIN_ATTRIBUTED_TRADES = 10
 
 
 # Strategy / Account Config
@@ -312,17 +314,32 @@ def filter_from_start_date(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
 def get_today_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Return rows recorded today in Central time, using a real timestamp when available."""
     if df.empty:
         return df
 
-    if "date_et" in df.columns:
-        today = datetime.now().strftime("%Y-%m-%d")
-        return df[df["date_et"].astype(str) == today]
+    for col in [
+        "timestamp_et",
+        "timestamp",
+        "filled_at",
+        "submitted_at",
+        "synced_at",
+        "exit_time",
+        "entry_time",
+        "created_at",
+        "updated_at",
+        "date_et",
+        "date",
+    ]:
+        if col in df.columns:
+            parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
+            if parsed.notna().any():
+                today_central = pd.Timestamp.now(tz=CENTRAL_TZ).date()
+                return df[parsed.dt.tz_convert(CENTRAL_TZ).dt.date == today_central]
 
-    df = parse_datetime_column(df.copy())
-    today_date = pd.Timestamp.now().date()
-    return df[df["_dt"].dt.date == today_date]
+    return df.iloc[0:0].copy()
 
 
 def count_status(df: pd.DataFrame, status_value: str) -> int:
@@ -517,7 +534,12 @@ def load_closed_trades() -> pd.DataFrame:
     return filter_from_start_date(df)
 
 
+
 def pair_realized_trades(closed_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Estimate realized trades using FIFO lots while keeping account/source isolation.
+    Buys and sells are never paired across different source environments.
+    """
     if closed_df.empty:
         return pd.DataFrame()
 
@@ -526,6 +548,10 @@ def pair_realized_trades(closed_df: pd.DataFrame) -> pd.DataFrame:
 
     if not required.issubset(set(df.columns)):
         return pd.DataFrame()
+
+    for col in ["source_env", "bot_group", "strategy", "model", "client_order_id"]:
+        if col not in df.columns:
+            df[col] = ""
 
     df = df.dropna(subset=["symbol", "side", "filled_qty", "filled_avg_price", "filled_at"])
     df = df[df["filled_qty"] > 0]
@@ -536,26 +562,28 @@ def pair_realized_trades(closed_df: pd.DataFrame) -> pd.DataFrame:
 
     for _, row in df.iterrows():
         symbol = str(row["symbol"]).upper()
+        source_env = str(row.get("source_env", "") or "").strip() or "unattributed_account"
         side = str(row["side"]).lower().replace("orderside.", "")
         qty = float(row["filled_qty"])
         price = float(row["filled_avg_price"])
         filled_at = row["filled_at"]
+        lot_key = (source_env, symbol)
 
         if qty <= 0:
             continue
 
-        if symbol not in open_lots:
-            open_lots[symbol] = []
+        if lot_key not in open_lots:
+            open_lots[lot_key] = []
 
         if "buy" in side:
-            open_lots[symbol].append({
+            open_lots[lot_key].append({
                 "qty": qty,
                 "price": price,
                 "time": filled_at,
                 "bot_group": row.get("bot_group", ""),
                 "strategy": row.get("strategy", ""),
                 "model": row.get("model", ""),
-                "source_env": row.get("source_env", ""),
+                "source_env": source_env,
                 "client_order_id": row.get("client_order_id", ""),
             })
             continue
@@ -563,8 +591,8 @@ def pair_realized_trades(closed_df: pd.DataFrame) -> pd.DataFrame:
         if "sell" in side:
             remaining = qty
 
-            while remaining > 0 and open_lots[symbol]:
-                lot = open_lots[symbol][0]
+            while remaining > 0 and open_lots[lot_key]:
+                lot = open_lots[lot_key][0]
                 matched_qty = min(remaining, lot["qty"])
                 pnl = (price - lot["price"]) * matched_qty
                 pnl_pct = ((price - lot["price"]) / lot["price"]) * 100 if lot["price"] else 0
@@ -575,7 +603,7 @@ def pair_realized_trades(closed_df: pd.DataFrame) -> pd.DataFrame:
                     duration_min = None
 
                 realized.append({
-                    "source_env": lot.get("source_env", ""),
+                    "source_env": source_env,
                     "bot_group": lot.get("bot_group", ""),
                     "strategy": lot.get("strategy", ""),
                     "model": lot.get("model", ""),
@@ -597,7 +625,7 @@ def pair_realized_trades(closed_df: pd.DataFrame) -> pd.DataFrame:
                 remaining -= matched_qty
 
                 if lot["qty"] <= 0.000001:
-                    open_lots[symbol].pop(0)
+                    open_lots[lot_key].pop(0)
 
     return pd.DataFrame(realized)
 
@@ -927,6 +955,8 @@ def build_time_of_day_analysis(realized_df: pd.DataFrame) -> pd.DataFrame:
 
     if df.empty:
         return pd.DataFrame()
+
+    df["exit_time"] = df["exit_time"].dt.tz_convert(CENTRAL_TZ)
 
     def bucket_time(ts):
         hour = ts.hour
@@ -1317,7 +1347,7 @@ def scanner_runtime_state(df):
     latest = str(df.iloc[0].get("event_type", "")).upper()
     if latest == "ERROR":
         return "Monitor Error", "Auto Scanner reported an error in its latest database event."
-    return "Running — Scanner Reporting", "Auto Scanner is writing shared health/activity events for both scanner strategies."
+    return "Online — Scanning", "Shared Auto Scanner is online; Strategy 1/2 trade attribution requires tagged orders."
 
 
 def fetch_strategy6_monitor_status():
@@ -1629,836 +1659,315 @@ if st.button("Refresh Dashboard"):
 
 tabs = st.tabs([
     "Command Center",
-    "Positions",
-    "Closed Trades",
-    "Realized P/L",
-    "Strategy 5",
-    "Trade Replay",
-    "Daily AI Recap",
-    "AI Recommendations",
-    "Weekly Review",
-    "AI Decision Center",
-    "Strategy Scoring",
-    "Symbol Intelligence",
-    "Time of Day",
-    "Rejection Intelligence",
-    "Strategy Heatmap",
-    "Rejected Orders",
-    "Bot Health",
-    "Daily Reports",
-    "Raw Logs",
-    "Strategy 6 Forward Test",
+    "Live Activity",
+    "Trades & P/L",
+    "Strategy 1/2 Scanner",
+    "Strategy 5 Simulation",
+    "Strategy 6 Forward Validation",
+    "Performance Review",
 ])
 
+strategy5_summary, strategy5_error = fetch_strategy5_daily_pnl()
 
-with tabs[0]:
-    st.header("Coach T Command Center")
-    st.caption("One dashboard for all six strategies: paper trading, simulation, and strategies still in development.")
-
-    strategy5_summary, strategy5_error = fetch_strategy5_daily_pnl()
-
-    st.subheader("Daily P/L by Strategy")
-    status_rows = []
+def trustworthy_status_rows():
+    rows = []
     for name, info in BOTS.items():
         df = bot_data.get(name, pd.DataFrame())
         today_df = get_today_rows(df)
         meta = STRATEGY_META.get(name, {})
         daily_pnl, pnl_source = get_daily_pnl_for_strategy(name, strategy5_summary, strategy6_endpoint_forward_df)
-        status_rows.append({
+        activity_label = "Activity Events"
+        if name == "Strategy 5 VWAP Reclaim Simulator":
+            activity_label = "Sim Trade Events"
+        elif name == "Strategy 6 Forex":
+            activity_label = "Sim Trade Rows"
+        rows.append({
             "Strategy": meta.get("number", name),
             "System": name,
             "Market": meta.get("market", ""),
             "Mode": meta.get("mode", ""),
             "Status": meta.get("status", ""),
-            "Daily P/L": format_daily_pnl(daily_pnl),
+            "Reported Daily P/L": format_daily_pnl(daily_pnl) if daily_pnl is not None else "Not attributable",
             "P/L Source": pnl_source,
-            "Rows Today": len(today_df),
-            "Total Rows": len(df),
+            "Today Activity": len(today_df),
+            "Total Activity": len(df),
+            "Activity Type": activity_label,
             "Last Event": get_last_event(df),
         })
+    return rows
 
-    status_df = pd.DataFrame(status_rows)
+status_rows = trustworthy_status_rows()
+status_df = pd.DataFrame(status_rows)
+scanner_df = bot_data.get("Breakout Momentum", pd.DataFrame())
+strategy6_forward_df = strategy6_endpoint_forward_df.copy()
+attributed_realized_df = realized_df.copy()
+if not attributed_realized_df.empty:
+    attribution_mask = pd.Series(False, index=attributed_realized_df.index)
+    for col in ["strategy", "model", "bot_group"]:
+        if col in attributed_realized_df.columns:
+            attribution_mask |= attributed_realized_df[col].fillna("").astype(str).str.strip().ne("")
+    attributed_realized_df = attributed_realized_df[attribution_mask].copy()
 
+with tabs[0]:
+    st.header("Coach T Command Center")
+    st.caption("Operational status first. P/L is shown only when its source can be stated honestly.")
+
+    st.subheader("Six Strategy Status Cards")
     for row_group in [status_rows[:3], status_rows[3:]]:
         cols = st.columns(3)
         for col, row in zip(cols, row_group):
             with col:
                 st.markdown(f"**{row['Strategy']} — {row['System']}**")
                 st.caption(f"{row['Market']} | {row['Mode']}")
-                st.metric("Daily P/L", row["Daily P/L"])
-                st.caption(f"P/L source: {row['P/L Source']}")
-                if str(row["Status"]).startswith("Running"):
+                st.metric("Reported Daily P/L", row["Reported Daily P/L"])
+                st.caption(f"Source: {row['P/L Source']}")
+                if str(row["Status"]).startswith(("Running", "Online")):
                     st.success(row["Status"])
-                elif row["Status"] in ("Not Running", "Status Not Connected"):
-                    st.info(row["Status"])
+                elif "Error" in str(row["Status"]) or "Not Running" in str(row["Status"]):
+                    st.error(row["Status"])
                 else:
                     st.warning(row["Status"])
-                if row["System"] == "Strategy 6 Forex":
+
+                if row["System"] in ("Breakout Momentum", "Pullback Reclaim"):
+                    st.caption("Shared scanner activity; no independent trade attribution yet.")
+                    st.caption(f"Activity events: {row['Total Activity']} | Last event: {row['Last Event']}")
+                elif row["System"] == "Strategy 6 Forex":
                     st.caption(strategy6_cycle_caption(strategy6_monitor_status))
-                    st.caption(f"Simulated trade rows: {row['Total Rows']} | {strategy6_status_detail}")
+                    st.caption(f"Simulated trade rows: {row['Total Activity']} | {strategy6_status_detail}")
                 else:
-                    st.caption(f"Rows loaded: {row['Total Rows']} | Last event: {row['Last Event']}")
+                    st.caption(f"{row['Activity Type']}: {row['Total Activity']} | Last event: {row['Last Event']}")
                     if row["System"] in runtime_details:
                         st.caption(runtime_details[row["System"]])
 
     st.info(
-        "Strategies 1-4 load health/activity from the shared Coach Q Trading Database; Strategies 3 and 4 also verify their webhook service URLs. "
-        "Strategy 5 uses its simulator endpoint. Strategy 6 uses its separate Python OANDA monitor endpoint. "
-        "Paper P/L can remain Pending until closed orders carry strategy tags."
+        "Strategies 1 and 2 share one Auto Scanner feed. Their green status means the scanner is online, "
+        "not that each strategy traded. Individual P/L stays unavailable until fills are strategy-tagged. "
+        "Strategy 5 reports simulator performance; Strategy 6 reports separate forward-validation simulation results."
     )
 
-    st.divider()
+    st.subheader("Status Table")
+    st.dataframe(status_df, width="stretch", hide_index=True)
 
-    st.subheader("Strategy 5 — Simulation Monitor")
-    st.warning(
-        "May 22 Strategy 5 results are a disrupted test session. "
-        "The monitor could not pull prices earlier in the day, and the after-hours MSFT manual test should not be used for performance scoring."
-    )
-
-    if strategy5_summary:
-        s5_c1, s5_c2, s5_c3, s5_c4 = st.columns(4)
-
-        realized_pnl = float(strategy5_summary.get("realized_pnl") or 0)
-        closed_trades = int(strategy5_summary.get("closed_trades") or 0)
-        win_rate = float(strategy5_summary.get("win_rate") or 0)
-        open_trades = int(strategy5_summary.get("open_trades") or 0)
-        open_symbols = strategy5_summary.get("open_symbols") or []
-
-        s5_c1.metric("S5 Reported Daily P/L", f"${realized_pnl:,.2f}")
-        s5_c2.metric("S5 Closed Trades", closed_trades)
-        s5_c3.metric("S5 Reported Win Rate", f"{win_rate:.1f}%")
-        s5_c4.metric("S5 Open Trades", open_trades)
-
-        if open_symbols:
-            st.caption("S5 Open Symbols: " + ", ".join(open_symbols))
-    else:
-        st.warning(f"Strategy 5 daily P/L unavailable: {strategy5_error}")
-
-    st.divider()
-    st.subheader("System Totals")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
+    st.subheader("System Totals — Clearly Labeled")
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Strategies Tracked", len(BOTS))
-    c2.metric("Closed Orders", len(closed_trades_df))
-    c3.metric("Realized P/L Rows", len(realized_df))
-    c4.metric("Rejected Signals", len(rejected_df))
-    c5.metric("Strategy 5 Rows", len(strategy5_df))
-
-    st.dataframe(status_df, width="stretch")
-
-    st.info(
-        "Strategy 6 Forex Portfolio remains a locked forward-validation candidate. "
-        "Its status card now reports the separate Python OANDA monitor service directly; live trading remains disabled."
-    )
+    c2.metric("Broker Fill Rows Synced", len(closed_trades_df))
+    c3.metric("Estimated Paired Trades", len(realized_df))
+    c4.metric("Rejected / Blocked Events", len(rejected_df))
+    st.caption("Estimated paired trades are for review only until every entry and exit is strategy-attributed.")
 
 with tabs[1]:
-    st.header("Unified Open Positions")
-    st.caption("Positions are pulled from Railway Alpaca account variables and de-duplicated by account/symbol.")
+    st.header("Live Activity")
+    st.caption("Service health, scanner activity, signals, blocks, rejections, and monitor errors.")
 
+    activity_name = st.selectbox(
+        "Select system activity",
+        list(BOTS.keys()),
+        key="live_activity_system",
+    )
+    activity_df = bot_data.get(activity_name, pd.DataFrame())
+
+    if activity_name in ("Breakout Momentum", "Pullback Reclaim"):
+        st.warning("Strategies 1 and 2 use the same scanner event feed. Rows here are shared scanner activity, not separate trades.")
+    elif activity_name == "Strategy 6 Forex":
+        st.info(strategy6_cycle_caption(strategy6_monitor_status))
+
+    if activity_df.empty:
+        st.info("No activity rows available for this system.")
+    else:
+        st.metric("Activity Events Loaded", len(activity_df))
+        st.dataframe(activity_df.head(300), width="stretch", hide_index=True)
+
+    st.subheader("Errors / Rejected / Blocked Events")
+    flagged_parts = []
+    for system_name, df in bot_data.items():
+        if df.empty:
+            continue
+        temp = df.copy()
+        text_cols = [col for col in ["event_type", "status", "decision", "message", "reason"] if col in temp.columns]
+        if not text_cols:
+            continue
+        joined = temp[text_cols].fillna("").astype(str).agg(" ".join, axis=1).str.upper()
+        mask = joined.str.contains("ERROR|REJECT|BLOCK", regex=True)
+        if mask.any():
+            flagged = temp[mask].copy()
+            flagged["System"] = system_name
+            flagged_parts.append(flagged)
+    flagged_df = pd.concat(flagged_parts, ignore_index=True, sort=False) if flagged_parts else pd.DataFrame()
+    if flagged_df.empty:
+        st.success("No error, blocked, or rejected activity rows loaded.")
+    else:
+        st.dataframe(flagged_df.head(300), width="stretch", hide_index=True)
+
+with tabs[2]:
+    st.header("Trades & P/L")
+    st.warning(
+        "Broker fill rows are factual. Realized P/L pairing below is an estimate, now isolated by account/source and symbol. "
+        "It should not be used to rank strategies until entries and exits are tagged."
+    )
+
+    st.subheader("Open Positions")
     positions_df = load_unique_open_positions()
-
     if positions_df.empty:
         st.success("No open positions found.")
     else:
-        ok_rows = positions_df[positions_df["Status"] == "OK"] if "Status" in positions_df.columns else positions_df
-        total_market = pd.to_numeric(ok_rows.get("Market Value", 0), errors="coerce").fillna(0).sum()
-        total_unrealized = pd.to_numeric(ok_rows.get("Unrealized P/L", 0), errors="coerce").fillna(0).sum()
+        st.dataframe(positions_df, width="stretch", hide_index=True)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Position Rows", len(ok_rows))
-        c2.metric("Total Market Value", f"${total_market:,.2f}")
-        c3.metric("Total Unrealized P/L", f"${total_unrealized:,.2f}")
-
-        st.dataframe(positions_df, width="stretch")
-
-
-with tabs[2]:
-    st.header("Closed Trades / Filled Orders")
-    st.caption("Synced by sync_closed_trades_v2.py on open and main refresh.")
-
+    st.subheader("Closed Broker Fill Rows")
     if closed_trades_df.empty:
-        st.warning("No closed_trades.csv found yet or no closed order rows were returned.")
+        st.info("No closed order rows synced.")
     else:
-        st.metric("Closed Order Rows", len(closed_trades_df))
-        st.dataframe(closed_trades_df.head(500), width="stretch")
+        st.dataframe(closed_trades_df.head(500), width="stretch", hide_index=True)
 
+    st.subheader("Estimated Realized P/L Pairing")
+    if realized_df.empty:
+        st.info("No estimated paired trades available.")
+    else:
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Estimated Paired Trades", len(realized_df))
+        r2.metric("Estimated Realized P/L", f"${realized_df['realized_pnl'].sum():,.2f}")
+        r3.metric("Estimated Win Rate", f"{get_win_rate_from_pnl(realized_df):.2f}%")
+        st.dataframe(realized_df.sort_values("exit_time", ascending=False), width="stretch", hide_index=True)
 
 with tabs[3]:
-    st.header("Realized P/L Pairing")
-    st.info("This pairs filled buys and sells FIFO by symbol. It is an estimate until each bot logs exact parent/child order IDs and strategy IDs on exits.")
+    st.header("Strategy 1/2 Auto Scanner")
+    st.caption("This is the shared scanner health and decision view for Breakout Momentum and Pullback Reclaim.")
 
-    if realized_df.empty:
-        st.warning("No paired realized trades yet.")
+    st.warning(
+        "Strategy 1 and Strategy 2 are not independently measurable yet. They share the same scanner event feed; "
+        "individual trade/P&L reporting requires strategy-tagged order fills."
+    )
+
+    if scanner_df.empty:
+        st.error("No shared Auto Scanner activity found. Confirm alpaca-direct-bot DATABASE_URL points to Coach Q Trading Database.")
     else:
-        total_pnl = realized_df["realized_pnl"].sum()
-        win_rate = get_win_rate_from_pnl(realized_df)
+        today_scanner = get_today_rows(scanner_df)
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Scanner Activity Events", len(scanner_df))
+        s2.metric("Today's Activity Events", len(today_scanner))
+        s3.metric("Last Scanner Event", get_last_event(scanner_df))
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Estimated Realized P/L", f"${total_pnl:,.2f}")
-        c2.metric("Paired Trades", len(realized_df))
-        c3.metric("Win Rate", f"{win_rate}%")
+        event_col = "event_type" if "event_type" in scanner_df.columns else "status" if "status" in scanner_df.columns else None
+        if event_col:
+            counts = scanner_df[event_col].fillna("Unknown").astype(str).value_counts().reset_index()
+            counts.columns = ["Event Type", "Count"]
+            st.subheader("Scanner Event Counts")
+            st.dataframe(counts, width="stretch", hide_index=True)
 
-        st.dataframe(realized_df.sort_values("exit_time", ascending=False), width="stretch")
-
-        st.download_button(
-            label="Download Realized P/L CSV",
-            data=realized_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"realized_pnl_{datetime.now().strftime('%Y-%m-%d')}.csv",
-            mime="text/csv",
-            key="download_realized_pnl_tab",
-        )
-
+        diagnostic_mask = pd.Series(False, index=scanner_df.index)
+        for col in ["event_type", "message", "reason", "status"]:
+            if col in scanner_df.columns:
+                diagnostic_mask |= scanner_df[col].fillna("").astype(str).str.upper().str.contains(
+                    "WATCHLIST|CYCLE_DIAGNOSTICS|SIGNAL|ORDER|BLOCK|REJECT|ERROR", regex=True
+                )
+        diagnostic_df = scanner_df[diagnostic_mask] if diagnostic_mask.any() else pd.DataFrame()
+        st.subheader("Latest Scanner Diagnostics")
+        if diagnostic_df.empty:
+            st.info("No detailed diagnostic rows recorded yet. The new scanner update will populate this during the next market session.")
+        else:
+            st.dataframe(diagnostic_df.head(300), width="stretch", hide_index=True)
 
 with tabs[4]:
-    st.header("Strategy 5 VWAP Reclaim Simulator")
-    st.caption("Strategy 5 is a TradingView-driven simulator writing trade activity through Railway/Postgres.")
+    st.header("Strategy 5 — VWAP Reclaim Simulation")
+    st.caption("Strategy 5 is a separate TradingView-driven simulator. Its P/L is not broker-account P/L.")
+
+    if strategy5_summary:
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Reported Daily P/L", f"${safe_float(strategy5_summary.get('realized_pnl'), 0.0):,.2f}")
+        s2.metric("Closed Sim Trades", int(strategy5_summary.get("closed_trades") or 0))
+        s3.metric("Reported Win Rate", f"{safe_float(strategy5_summary.get('win_rate'), 0.0):.1f}%")
+        s4.metric("Open Sim Trades", int(strategy5_summary.get("open_trades") or 0))
+    else:
+        st.warning(f"Strategy 5 simulator summary unavailable: {strategy5_error}")
 
     if strategy5_df.empty:
-        st.warning("No Strategy 5 rows found yet.")
-        st.info("For Railway accuracy, Strategy 5 must write to a shared Postgres table such as trade_events, not only to a CSV inside its own service.")
+        st.info("No Strategy 5 activity rows loaded.")
     else:
-        today_strategy5 = get_today_rows(strategy5_df)
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Strategy 5 Total Rows", len(strategy5_df))
-        c2.metric("Strategy 5 Rows Today", len(today_strategy5))
-        c3.metric("Last Strategy 5 Event", get_last_event(strategy5_df))
-
-        st.dataframe(strategy5_df.head(500), width="stretch")
-
-        st.download_button(
-            label="Download Strategy 5 CSV",
-            data=strategy5_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"strategy5_report_{datetime.now().strftime('%Y-%m-%d')}.csv",
-            mime="text/csv",
-            key="download_strategy5_csv",
-        )
-
+        st.dataframe(strategy5_df.head(500), width="stretch", hide_index=True)
 
 with tabs[5]:
-    st.header("Trade Replay Viewer")
-
-    if realized_df.empty:
-        st.warning("No trades available for replay.")
-    else:
-        replay_df = realized_df.sort_values("exit_time", ascending=False).reset_index(drop=True)
-        options = [
-            f"{i}: {r['symbol']} | P/L ${r['realized_pnl']} | {r['grade']} | Exit {r['exit_time']}"
-            for i, r in replay_df.iterrows()
-        ]
-
-        pick = st.selectbox("Select trade to review", options)
-        idx = int(str(pick).split(":")[0])
-        trade = replay_df.iloc[idx]
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Symbol", trade["symbol"])
-        c2.metric("Grade", trade["grade"])
-        c3.metric("P/L", f"${trade['realized_pnl']:,.2f}")
-        c4.metric("P/L %", f"{trade['pnl_pct']}%")
-
-        st.write("Trade Details")
-        st.dataframe(pd.DataFrame([trade]), width="stretch")
-
-        st.write("Review Notes")
-        st.info(trade["notes"])
-
-
-with tabs[6]:
-    st.header("Daily AI Recap")
-    st.info("This is a rule-based AI-style recap from your logs.")
-    st.text_area("Daily Recap", build_v9_recap(realized_df, rejected_df), height=260)
-
-
-with tabs[7]:
-    st.header("AI Recommendations")
-    st.warning("These are recommendations only. Do not auto-change bot rules without reviewing the data first.")
-
-    rec_df = build_ai_recommendations(realized_df, rejected_df)
-    st.dataframe(rec_df, width="stretch")
-
-    high_priority = rec_df[rec_df["Priority"] == "High"] if "Priority" in rec_df.columns else pd.DataFrame()
-
-    if not high_priority.empty:
-        st.subheader("High Priority Actions")
-        for _, row in high_priority.iterrows():
-            st.write(f"**{row['Area']}** — {row['Recommendation']}")
-
-
-with tabs[8]:
-    st.header("Weekly Strategy Review")
-
-    weekly_df = build_weekly_review(realized_df)
-
-    if weekly_df.empty:
-        st.warning("Not enough weekly trade data yet.")
-    else:
-        st.subheader("7-Day Strategy Performance")
-        st.dataframe(weekly_df, width="stretch")
-        st.bar_chart(weekly_df.set_index("Strategy")["Total P/L"])
-
-        best = weekly_df.iloc[0]
-        worst = weekly_df.sort_values("Total P/L").iloc[0]
-
-        c1, c2 = st.columns(2)
-        c1.metric("Best Weekly Strategy", best["Strategy"], f"${best['Total P/L']:.2f}")
-        c2.metric("Worst Weekly Strategy", worst["Strategy"], f"${worst['Total P/L']:.2f}")
-
-        st.info("Use weekly data before making major strategy changes. Daily data alone is often noisy.")
-
-
-with tabs[9]:
-    st.header("AI Decision Center")
-
-    confidence = build_confidence_score(realized_df)
-
-    c1, c2 = st.columns(2)
-    c1.metric("System Confidence Score", f"{confidence}/100")
-
-    if confidence >= 75:
-        c2.success("System performance currently stable.")
-    elif confidence >= 50:
-        c2.warning("Mixed results. Continue collecting data.")
-    else:
-        c2.error("Weak performance. Review strategies carefully.")
-
-    st.subheader("Parameter Suggestions")
-    param_df = build_parameter_suggestions(realized_df)
-
-    if param_df.empty:
-        st.success("No major parameter warnings yet.")
-    else:
-        st.dataframe(param_df, width="stretch")
-
-    st.subheader("Do-Not-Trade Watchlist")
-    blocked_df = build_do_not_trade(realized_df)
-
-    if blocked_df.empty:
-        st.success("No symbols currently flagged.")
-    else:
-        st.dataframe(blocked_df, width="stretch")
-
-    st.subheader("Tomorrow Game Plan")
-    for item in build_tomorrow_plan(realized_df):
-        st.write(f"- {item}")
-
-    st.subheader("AI Strategy Coach")
-    st.info("Do not change strategy rules based on one day alone. Focus on repeated weaknesses across multiple trades and time windows.")
-
-
-with tabs[10]:
-    st.header("Strategy Scoring / Grading")
-    score_rows = []
-
-    if not realized_df.empty:
-        by_symbol = realized_df.groupby("symbol").agg(
-            trades=("symbol", "count"),
-            total_pnl=("realized_pnl", "sum"),
-            avg_pnl=("realized_pnl", "mean"),
-            win_rate=("realized_pnl", lambda x: round((x > 0).mean() * 100, 2)),
-        ).reset_index()
-
-        by_symbol["score"] = by_symbol.apply(
-            lambda r: round(
-                (r["win_rate"] * 0.4)
-                + (max(min(r["total_pnl"], 100), -100) * 0.3)
-                + (r["trades"] * 2),
-                2,
-            ),
-            axis=1,
-        )
-
-        by_symbol = by_symbol.sort_values("score", ascending=False)
-        st.subheader("Symbol Scoreboard")
-        st.dataframe(by_symbol, width="stretch")
-    else:
-        st.warning("No realized trades to score yet.")
-
-    if not realized_df.empty and "quality_score" in realized_df.columns:
-        st.subheader("Trade Quality Grades")
-        quality_summary = realized_df["quality_grade"].value_counts().reset_index()
-        quality_summary.columns = ["Grade", "Count"]
-        st.dataframe(quality_summary, width="stretch")
-
-    st.subheader("Strategy Activity Scoreboard")
-
-    for name, df in bot_data.items():
-        accepted = count_status(df, "ACCEPTED")
-        rejected = count_status(df, "REJECTED")
-        submitted = count_status(df, "ORDER_SUBMITTED")
-        simulated = count_status(df, "SIMULATED")
-        total = accepted + rejected + submitted + simulated
-        score = (accepted * 2) + (submitted * 3) + simulated - rejected
-
-        score_rows.append({
-            "Strategy": name,
-            "Accepted": accepted,
-            "Rejected": rejected,
-            "Orders Submitted": submitted,
-            "Simulated": simulated,
-            "Activity Score": score,
-            "Acceptance %": round((accepted / total) * 100, 2) if total else 0,
-        })
-
-    st.dataframe(pd.DataFrame(score_rows).sort_values("Activity Score", ascending=False), width="stretch")
-
-
-with tabs[11]:
-    st.header("Symbol Intelligence")
-
-    symbol_df = build_symbol_intelligence(realized_df)
-
-    if symbol_df.empty:
-        st.warning("No realized trades available for symbol intelligence yet.")
-    else:
-        c1, c2 = st.columns(2)
-        best = symbol_df.iloc[0]
-        worst = symbol_df.sort_values("total_pnl").iloc[0]
-
-        c1.metric("Best Symbol", best["symbol"], f"${best['total_pnl']:.2f}")
-        c2.metric("Worst Symbol", worst["symbol"], f"${worst['total_pnl']:.2f}")
-
-        st.subheader("Symbol Scoreboard")
-        st.dataframe(symbol_df, width="stretch")
-        st.bar_chart(symbol_df.set_index("symbol")[["total_pnl", "avg_pnl"]])
-
-
-with tabs[12]:
-    st.header("Time-of-Day Analysis")
-
-    time_df = build_time_of_day_analysis(realized_df)
-
-    if time_df.empty:
-        st.warning("No realized trades available for time-of-day analysis yet.")
-    else:
-        st.dataframe(time_df, width="stretch")
-        st.bar_chart(time_df.set_index("time_bucket")[["total_pnl", "avg_pnl"]])
-        st.info("Use this to decide whether to block or reduce size during weak time windows.")
-
-
-with tabs[13]:
-    st.header("Rejection Intelligence")
-
-    if rejected_df.empty:
-        st.success("No rejected orders found.")
-    else:
-        reason_col = "reason" if "reason" in rejected_df.columns else "message" if "message" in rejected_df.columns else None
-
-        if reason_col:
-            temp = rejected_df.copy()
-            temp["rejection_class"] = temp[reason_col].apply(classify_rejection)
-
-            st.subheader("Rejection Classes")
-            class_summary = temp["rejection_class"].value_counts().reset_index()
-            class_summary.columns = ["Rejection Class", "Count"]
-            st.dataframe(class_summary, width="stretch")
-
-            st.subheader("Detailed Rejections")
-            st.dataframe(temp.tail(300), width="stretch")
-            st.bar_chart(class_summary.set_index("Rejection Class")["Count"])
-        else:
-            st.warning("Rejected rows exist, but no reason/message column was found.")
-            st.dataframe(rejected_df, width="stretch")
-
-
-with tabs[14]:
-    st.header("Strategy Heatmap")
-
-    heat = build_strategy_heatmap(realized_df)
-
-    if heat.empty:
-        st.warning("No realized trades available for heatmap yet.")
-    else:
-        st.info("Green/positive days and red/negative days are shown as values by symbol.")
-        st.dataframe(heat, width="stretch")
-        st.line_chart(heat)
-
-
-with tabs[15]:
-    st.header("Rejected Orders Diagnostics")
-
-    if rejected_df.empty:
-        st.success("No rejected orders found.")
-    else:
-        reason_col = "reason" if "reason" in rejected_df.columns else "message" if "message" in rejected_df.columns else None
-
-        if reason_col:
-            reason_summary = rejected_df[reason_col].astype(str).value_counts().reset_index()
-            reason_summary.columns = ["Reason", "Count"]
-            st.subheader("Reason Summary")
-            st.dataframe(reason_summary, width="stretch")
-
-        st.subheader("Rejected Details")
-        st.dataframe(rejected_df.tail(300), width="stretch")
-
-
-with tabs[16]:
-    st.header("Railway-Aware Bot Health")
-    st.info("This checks live Alpaca API access from Railway variables instead of local Windows folders.")
-
-    health_rows = []
-
-    for name, info in BOTS.items():
-        if info.get("type") == "development":
-            health_rows.append({
-                "Strategy": name,
-                "Bot Group": info.get("bot_group", ""),
-                "_Account Key": info.get("api_key_var", ""),
-                "API Connected": "N/A",
-                "Positions Connected": "N/A",
-                "Open Positions": 0,
-                "Account Status": "Development / Not Running",
-                "Equity": 0.0,
-                "Cash": 0.0,
-                "Buying Power": 0.0,
-                "Last Log Event": get_last_event(bot_data.get(name, pd.DataFrame())),
-                "Rows Loaded": len(bot_data.get(name, pd.DataFrame())),
-                "Bot Type": info.get("type", ""),
-            })
-            continue
-
-        if info.get("type") == "simulator":
-            strategy5_rows = len(strategy5_df)
-            health_rows.append({
-                "Strategy": name,
-                "Bot Group": info.get("bot_group", ""),
-                "_Account Key": info.get("api_key_var", ""),
-                "API Connected": "N/A",
-                "Positions Connected": "N/A",
-                "Open Positions": 0,
-                "Account Status": "Simulator",
-                "Equity": 0.0,
-                "Cash": 0.0,
-                "Buying Power": 0.0,
-                "Last Log Event": get_last_event(strategy5_df),
-                "Rows Loaded": strategy5_rows,
-                "Bot Type": info.get("type", ""),
-            })
-            continue
-
-        account, account_err = load_alpaca_account(info)
-        positions, positions_err = load_alpaca_positions(info)
-
-        api_ok = account is not None
-        positions_ok = positions_err == ""
-
-        if api_ok:
-            equity = safe_float(account.equity)
-            cash = safe_float(account.cash)
-            buying_power = safe_float(account.buying_power)
-            account_status = str(account.status)
-        else:
-            equity = 0.0
-            cash = 0.0
-            buying_power = 0.0
-            account_status = account_err
-
-        health_rows.append({
-            "Strategy": name,
-            "Bot Group": info.get("bot_group", ""),
-            "_Account Key": info.get("api_key_var", ""),
-            "API Connected": "Yes" if api_ok else "No",
-            "Positions Connected": positions_ok,
-            "Open Positions": len(positions),
-            "Account Status": account_status,
-            "Equity": round(equity, 2),
-            "Cash": round(cash, 2),
-            "Buying Power": round(buying_power, 2),
-            "Last Log Event": get_last_event(bot_data.get(name, pd.DataFrame())),
-            "Rows Loaded": len(bot_data.get(name, pd.DataFrame())),
-            "Bot Type": info.get("type", ""),
-        })
-
-    health_df = pd.DataFrame(health_rows)
-
-    connected_accounts_df = pd.DataFrame()
-    if not health_df.empty:
-        connected_accounts_df = health_df[health_df["API Connected"] == "Yes"].copy()
-        connected_accounts_df = connected_accounts_df.drop_duplicates(subset=["_Account Key"])
-
-    unique_accounts_connected = len(connected_accounts_df)
-    unique_buying_power = (
-        pd.to_numeric(connected_accounts_df["Buying Power"], errors="coerce").fillna(0).sum()
-        if not connected_accounts_df.empty else 0.0
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Unique Alpaca Accounts Connected", unique_accounts_connected)
-    c2.metric("Total Open Positions", int(pd.to_numeric(health_df["Open Positions"], errors="coerce").fillna(0).sum()) if not health_df.empty else 0)
-    c3.metric("Total Unique Buying Power", f"${unique_buying_power:,.2f}")
-    c4.metric("Strategy Health Rows", len(health_df))
-
-    st.subheader("Account / API Health")
-    display_health_df = health_df.drop(columns=["_Account Key"], errors="ignore")
-    st.dataframe(display_health_df, width="stretch")
-
-    st.subheader("Health Notes")
-    st.write("- API Connected means Railway can authenticate to that Alpaca paper account.")
-    st.write("- Positions Connected means Railway can pull open positions from that account.")
-    st.write("- Strategy 5 is a simulator loaded from shared Postgres trade_events.")
-    st.write("- Strategy 6 Forex Portfolio is intentionally live-disabled while the locked candidate is forward validated.")
-    st.write("- Breakout Momentum and Pullback Reclaim are separate strategies sharing one Alpaca account; that account is counted once in totals.")
-
-
-with tabs[17]:
-    st.header("Daily Reports")
-    report_date = datetime.now().strftime("%Y-%m-%d")
-
-    summary_rows = []
-    for name, df in bot_data.items():
-        today_df = get_today_rows(df)
-        summary_rows.append({
-            "Strategy": name,
-            "Rows Today": len(today_df),
-            "Total Rows": len(df),
-            "Accepted": count_status(df, "ACCEPTED"),
-            "Rejected": count_status(df, "REJECTED"),
-            "Orders Submitted": count_status(df, "ORDER_SUBMITTED"),
-            "Simulated": count_status(df, "SIMULATED"),
-            "Last Event": get_last_event(df),
-        })
-
-    report_df = pd.DataFrame(summary_rows)
-
-    st.subheader("Daily Strategy Summary")
-    st.dataframe(report_df, width="stretch")
-
-    st.download_button(
-        label="Download Daily Strategy Summary CSV",
-        data=report_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"daily_strategy_summary_{report_date}.csv",
-        mime="text/csv",
-    )
-
-    combined_reports = []
-    for name, df in bot_data.items():
-        if not df.empty:
-            temp = df.copy()
-            temp["Strategy Name"] = name
-            combined_reports.append(temp)
-
-    if combined_reports:
-        full_df = pd.concat(combined_reports, ignore_index=True, sort=False)
-        full_df = parse_datetime_column(full_df)
-        full_df = full_df.sort_values("_dt", ascending=False)
-
-        st.subheader("Full Activity Report")
-        st.dataframe(full_df.head(300), width="stretch")
-
-        st.download_button(
-            label="Download Full Daily Activity CSV",
-            data=full_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"daily_activity_report_{report_date}.csv",
-            mime="text/csv",
-            key="download_daily_summary",
-        )
-
-    if not realized_df.empty:
-        st.download_button(
-            label="Download Realized P/L CSV",
-            data=realized_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"realized_pnl_{report_date}.csv",
-            mime="text/csv",
-            key="download_full_activity",
-        )
-
-    if not strategy5_df.empty:
-        st.download_button(
-            label="Download Strategy 5 CSV",
-            data=strategy5_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"strategy5_report_{report_date}.csv",
-            mime="text/csv",
-            key="download_strategy5_daily_report",
-        )
-
-
-with tabs[18]:
-    st.header("Raw Logs")
-
-    selected_bot = st.selectbox("Select strategy", list(BOTS.keys()))
-    selected_df = bot_data[selected_bot]
-
-    if selected_df.empty:
-        st.warning("No log data found.")
-    else:
-        st.dataframe(selected_df.tail(300), width="stretch")
-        st.write("Columns found:")
-        st.code(", ".join(selected_df.columns.astype(str)))
-
-
-
-with tabs[19]:
-    st.header("Strategy 6 — Forex Portfolio Forward Validation")
+    st.header("Strategy 6 — Forex Forward Validation")
     if strategy6_status_label.startswith("Running"):
-        st.success(f"Status: {strategy6_status_label}. Live trading is disabled; the rules remain locked.")
+        st.success(f"{strategy6_status_label}. Live trading remains disabled.")
     elif strategy6_status_label == "Monitor Error":
-        st.error(f"Status: {strategy6_status_label}. {strategy6_status_detail}")
+        st.error(f"{strategy6_status_label}: {strategy6_status_detail}")
     else:
-        st.warning(f"Status: {strategy6_status_label}. {strategy6_status_detail}")
+        st.warning(f"{strategy6_status_label}: {strategy6_status_detail}")
 
     cycle = (strategy6_monitor_status or {}).get("last_monitor_cycle") or {}
-    cycle_summary = cycle.get("summary") or {}
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Market", "Forex Portfolio")
-    c2.metric("Pairs Tracked", len(STRATEGY6_CANDIDATE["pairs"]))
-    c3.metric("Current Mode", "Forward Validation")
-    c4.metric("Last Scan Pairs", cycle_summary.get("pairs_checked", "—"))
-    c5.metric("Scan Errors", cycle_summary.get("pairs_error", "—"))
+    summary = cycle.get("summary") or {}
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pairs Tracked", len(STRATEGY6_CANDIDATE["pairs"]))
+    c2.metric("Last Scan Pairs", summary.get("pairs_checked", "—"))
+    c3.metric("Scan Errors", summary.get("pairs_error", "—"))
+    c4.metric("Forward Sim Rows", len(strategy6_forward_df))
     st.caption(strategy6_cycle_caption(strategy6_monitor_status))
-    st.caption(f"Live Trading: {STRATEGY6_CANDIDATE['live_trading']} | {strategy6_status_detail}")
 
-    st.subheader("Locked Candidate")
-    st.write(f"**{STRATEGY6_CANDIDATE['name']}**")
+    st.subheader("Locked Candidate Rules")
     rules_df = pd.DataFrame([
+        {"Rule": "Candidate", "Locked Setting": STRATEGY6_CANDIDATE["name"]},
         {"Rule": "Pairs", "Locked Setting": ", ".join(STRATEGY6_CANDIDATE["pairs"])},
         {"Rule": "Trading Session", "Locked Setting": STRATEGY6_CANDIDATE["session"]},
-        {"Rule": "Structure Direction", "Locked Setting": STRATEGY6_CANDIDATE["direction_rule"]},
-        {"Rule": "Entry Zone", "Locked Setting": STRATEGY6_CANDIDATE["entry_zone"]},
-        {"Rule": "Confirmation", "Locked Setting": STRATEGY6_CANDIDATE["confirmation"]},
-        {"Rule": "Stop", "Locked Setting": STRATEGY6_CANDIDATE["stop_rule"]},
-        {"Rule": "Target", "Locked Setting": STRATEGY6_CANDIDATE["target"]},
-        {"Rule": "Estimated Cost", "Locked Setting": STRATEGY6_CANDIDATE["estimated_cost"]},
+        {"Rule": "Direction", "Locked Setting": STRATEGY6_CANDIDATE["direction_rule"]},
+        {"Rule": "Entry / Confirmation", "Locked Setting": f"{STRATEGY6_CANDIDATE['entry_zone']} | {STRATEGY6_CANDIDATE['confirmation']}"},
+        {"Rule": "Stop / Target", "Locked Setting": f"{STRATEGY6_CANDIDATE['stop_rule']} | Target {STRATEGY6_CANDIDATE['target']}"},
     ])
     st.dataframe(rules_df, width="stretch", hide_index=True)
 
-    st.subheader("Known-History Candidate Benchmark")
-    st.info(
-        "This benchmark helped select the candidate. It is not new forward-test performance "
-        "and should not be mixed with future validation trades."
-    )
-    h1, h2, h3, h4, h5, h6 = st.columns(6)
+    st.subheader("Historical Benchmark — Candidate Selection Only")
+    h1, h2, h3, h4, h5 = st.columns(5)
     h1.metric("Historical Trades", STRATEGY6_KNOWN_HISTORY["trades"])
     h2.metric("Historical Net P/L", f"${STRATEGY6_KNOWN_HISTORY['net_pnl']:,.2f}")
     h3.metric("Historical Net R", f"{STRATEGY6_KNOWN_HISTORY['net_r']:.2f} R")
     h4.metric("Historical Win Rate", f"{STRATEGY6_KNOWN_HISTORY['win_rate']:.2f}%")
     h5.metric("Historical Profit Factor", f"{STRATEGY6_KNOWN_HISTORY['profit_factor']:.3f}")
-    h6.metric("Historical Max DD", f"${STRATEGY6_KNOWN_HISTORY['max_drawdown']:,.2f}")
-    st.caption(f"Known-history period: {STRATEGY6_KNOWN_HISTORY['period']}")
+    st.caption("Historical performance is not forward-validation performance.")
 
-    st.divider()
-    st.subheader("Forward Validation Log")
-    st.caption(
-        "Upload future Strategy 6 trade results here as they are recorded. "
-        "The forward sample begins after the candidate was locked and must not include the known-history backtest."
-    )
-
-    blank_template = pd.DataFrame(columns=STRATEGY6_FORWARD_COLUMNS)
-    st.download_button(
-        label="Download Blank Strategy 6 Forward Log Template",
-        data=blank_template.to_csv(index=False).encode("utf-8"),
-        file_name="strategy6_forward_validation_log.csv",
-        mime="text/csv",
-        key="download_strategy6_forward_template",
-    )
-
-    strategy6_upload = st.file_uploader(
-        "Upload Strategy 6 forward validation CSV",
-        type=["csv"],
-        key="strategy6_forward_validation_upload",
-    )
-
-    strategy6_existing_path = Path("strategy6_forward_validation_log.csv")
-    db_forward_df = load_strategy6_forward_events_from_postgres()
-    forward_df = pd.DataFrame()
-
-    if not strategy6_endpoint_forward_df.empty:
-        forward_df = strategy6_endpoint_forward_df
-        st.success("Forward-validation log loaded automatically from the Strategy 6 simulation monitor service.")
-        st.caption(
-            "This endpoint is the live-disabled Strategy 6 validation source of truth. "
-            "Use CSV upload below only for offline/manual review."
-        )
-    elif not db_forward_df.empty:
-        forward_df = db_forward_df
-        st.success("Forward-validation log loaded automatically from dashboard Postgres fallback.")
-        st.caption(
-            "This is a fallback data source. Configure STRATEGY6_MONITOR_BASE_URL to show monitor health and its direct results endpoint."
-        )
-        if strategy6_upload is not None:
-            st.info("A CSV was uploaded, but Postgres data is displayed because live database records take priority.")
-    elif strategy6_upload is not None:
-        try:
-            forward_df = pd.read_csv(strategy6_upload)
-            st.success("Uploaded forward-validation log loaded for offline review; no Postgres Strategy 6 records were found.")
-        except Exception as exc:
-            st.error(f"Could not read uploaded forward-validation log: {exc}")
-    elif strategy6_existing_path.exists():
-        forward_df = load_log(strategy6_existing_path)
-        if not forward_df.empty:
-            st.caption("Loaded strategy6_forward_validation_log.csv from the dashboard service files.")
-
-    if forward_df.empty:
+    st.subheader("Forward Simulation Results")
+    if strategy6_forward_df.empty:
         st.info(
-            "No Strategy 6 forward-validation trades are in Postgres yet. "
-            "When the Python OANDA monitor produces a simulated entry, it will appear here automatically. "
-            f"Keep rules locked until at least {STRATEGY6_CANDIDATE['validation_goal']} new trades are recorded "
-            f"(preferred review point: {STRATEGY6_CANDIDATE['preferred_validation_goal']} trades)."
+            "No forward simulated trades recorded yet. The Python OANDA monitor is the source of truth; "
+            "no manual CSV upload is required."
         )
     else:
-        missing_cols = [col for col in STRATEGY6_FORWARD_COLUMNS if col not in forward_df.columns]
-        if missing_cols:
-            st.warning("Forward log is missing expected columns: " + ", ".join(missing_cols))
+        complete = strategy6_forward_df.copy()
+        if "pnl_dollars" in complete.columns:
+            complete["pnl_dollars"] = pd.to_numeric(complete["pnl_dollars"], errors="coerce").fillna(0)
+        if "net_r" in complete.columns:
+            complete["net_r"] = pd.to_numeric(complete["net_r"], errors="coerce").fillna(0)
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Forward Sim Rows", len(complete))
+        f2.metric("Forward Net P/L", f"${complete.get('pnl_dollars', pd.Series(dtype=float)).sum():,.2f}")
+        f3.metric("Forward Net R", f"{complete.get('net_r', pd.Series(dtype=float)).sum():.2f} R")
+        st.dataframe(complete, width="stretch", hide_index=True)
 
-        for numeric_col in ["net_r", "pnl_dollars"]:
-            if numeric_col in forward_df.columns:
-                forward_df[numeric_col] = pd.to_numeric(forward_df[numeric_col], errors="coerce").fillna(0)
+with tabs[6]:
+    st.header("Performance Review")
+    st.caption("Performance analysis is shown only when the trade data is sufficiently attributed.")
 
-        completed_forward = forward_df.copy()
-        if "result" in completed_forward.columns:
-            completed_forward = completed_forward[
-                completed_forward["result"].astype(str).str.upper().isin([
-                    "WIN", "LOSS", "TARGET", "STOP", "CLOSED",
-                    "TARGET_HIT", "STOP_HIT", "FORWARD_EXIT", "MANUAL_CLOSE"
-                ])
-            ]
+    attributed_count = len(attributed_realized_df)
+    st.metric("Attributed Paired Trades Available", attributed_count)
 
-        completed_count = len(completed_forward)
-        pnl = float(completed_forward["pnl_dollars"].sum()) if "pnl_dollars" in completed_forward.columns else 0.0
-        net_r = float(completed_forward["net_r"].sum()) if "net_r" in completed_forward.columns else 0.0
-        wins = int((completed_forward["pnl_dollars"] > 0).sum()) if "pnl_dollars" in completed_forward.columns else 0
-        win_rate = (wins / completed_count * 100) if completed_count else 0.0
-
-        positives = completed_forward.loc[completed_forward.get("pnl_dollars", pd.Series(dtype=float)) > 0, "pnl_dollars"].sum() if "pnl_dollars" in completed_forward.columns else 0.0
-        negatives = abs(completed_forward.loc[completed_forward.get("pnl_dollars", pd.Series(dtype=float)) < 0, "pnl_dollars"].sum()) if "pnl_dollars" in completed_forward.columns else 0.0
-        profit_factor = positives / negatives if negatives else None
-
-        f1, f2, f3, f4, f5 = st.columns(5)
-        f1.metric("Forward Trades", completed_count, f"{completed_count}/{STRATEGY6_CANDIDATE['validation_goal']} minimum")
-        f2.metric("Forward Net P/L", f"${pnl:,.2f}")
-        f3.metric("Forward Net R", f"{net_r:.2f} R")
-        f4.metric("Forward Win Rate", f"{win_rate:.2f}%")
-        f5.metric("Forward Profit Factor", "N/A" if profit_factor is None else f"{profit_factor:.3f}")
-
-        if completed_count < STRATEGY6_CANDIDATE["validation_goal"]:
-            st.warning(
-                f"Continue collecting trades. Only {completed_count} of "
-                f"{STRATEGY6_CANDIDATE['validation_goal']} minimum forward-validation trades are recorded."
-            )
-        elif completed_count < STRATEGY6_CANDIDATE["preferred_validation_goal"]:
-            st.info("Minimum review sample reached. Keep collecting toward the preferred 50-trade review before deployment decisions.")
-        else:
-            st.success("Preferred forward-validation sample size reached. Review performance before any paper-trading decision.")
-
-        st.dataframe(forward_df, width="stretch", hide_index=True)
-        st.download_button(
-            label="Download Reviewed Strategy 6 Forward Log",
-            data=forward_df.to_csv(index=False).encode("utf-8"),
-            file_name="strategy6_forward_validation_log_reviewed.csv",
-            mime="text/csv",
-            key="download_strategy6_forward_review",
+    if attributed_count < ANALYSIS_MIN_ATTRIBUTED_TRADES:
+        st.warning(
+            f"Not enough accurately attributed closed trades for recommendations. "
+            f"Current sample: {attributed_count}; minimum for review: {ANALYSIS_MIN_ATTRIBUTED_TRADES}. "
+            "Keep systems in paper/simulation mode and collect tagged trade results."
         )
+        st.info(
+            "Analysis is intentionally withheld so estimated or shared-account activity does not create misleading recommendations."
+        )
+    else:
+        weekly_df = build_weekly_review(attributed_realized_df)
+        symbol_df = build_symbol_intelligence(attributed_realized_df)
+        time_df = build_time_of_day_analysis(attributed_realized_df)
 
-    st.subheader("Validation Rules")
-    st.checkbox("Candidate rules locked", value=True, disabled=True)
-    st.checkbox("Nine-pair historical benchmark complete", value=True, disabled=True)
-    st.checkbox("Walk-forward stability review complete", value=True, disabled=True)
-    st.checkbox("Forward sample of 30 new trades complete", value=False, disabled=True)
-    st.checkbox("Forward sample of 50 new trades complete", value=False, disabled=True)
-    st.checkbox("Approved for paper execution", value=False, disabled=True)
-
-    st.info(
-        "Strategy 6 is generated only by its Python OANDA simulation monitor. "
-        "The dashboard reads the monitor service endpoint when STRATEGY6_MONITOR_BASE_URL is configured. "
-        "Live broker execution remains disabled."
-    )
-
+        if not weekly_df.empty:
+            st.subheader("Weekly Review")
+            st.dataframe(weekly_df, width="stretch", hide_index=True)
+        if not symbol_df.empty:
+            st.subheader("Symbol Results")
+            st.dataframe(symbol_df, width="stretch", hide_index=True)
+        if not time_df.empty:
+            st.subheader("Central-Time Session Analysis")
+            st.dataframe(time_df, width="stretch", hide_index=True)
